@@ -1004,10 +1004,10 @@ impl<S: HttpSend> BaseTable for RemoteTable<S> {
             body["name"] = serde_json::Value::String(name.clone());
         }
 
-        // Warn if train=false is specified since it's not supported in remote tables
+        // Warn if train=false is specified since it's not meaningful
         if !index.train {
             log::warn!(
-                "train=false is not supported for remote tables. The index will be created empty and automatically updated in the background."
+                "train=false has no effect remote tables. The index will be created empty and automatically populated in the background."
             );
         }
 
