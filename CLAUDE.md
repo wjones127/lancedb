@@ -15,10 +15,10 @@ Project layout:
 
 Common commands:
 
-* Check for compiler errors: `cargo check --features remote --tests --examples`
-* Run tests: `cargo test --features remote --tests`
-* Run specific test: `cargo test --features remote -p <package_name> --test <test_name>`
-* Lint: `cargo clippy --features remote --tests --examples`
+* Check for compiler errors: `cargo check --quiet --features remote --tests --examples`
+* Run tests: `cargo test --quiet --features remote --tests`
+* Run specific test: `cargo test --quiet --features remote -p <package_name> --test <test_name>`
+* Lint: `cargo clippy --quiet --features remote --tests --examples`
 * Format: `cargo fmt --all`
 
 Before committing changes, run formatting.
