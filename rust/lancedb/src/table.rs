@@ -50,7 +50,6 @@ use crate::arrow::IntoArrow;
 use crate::connection::NoData;
 use crate::embeddings::{EmbeddingDefinition, EmbeddingRegistry, MaybeEmbedded, MemoryRegistry};
 use crate::error::{Error, Result};
-use crate::index::scalar::FtsIndexBuilder;
 use crate::index::vector::{
     suggested_num_partitions_for_hnsw, IvfFlatIndexBuilder, IvfHnswPqIndexBuilder,
     IvfHnswSqIndexBuilder, IvfPqIndexBuilder, VectorIndex,
@@ -1649,42 +1648,42 @@ impl NativeTable {
             .collect())
     }
 
-    async fn create_ivf_flat_index(
+    // Convert LanceDB Index to Lance IndexParams
+    async fn make_index_params(
         &self,
-        index: IvfFlatIndexBuilder,
         field: &Field,
-        replace: bool,
-    ) -> Result<()> {
-        if !supported_vector_data_type(field.data_type()) {
-            return Err(Error::InvalidInput {
-                message: format!(
-                    "An IVF Flat index cannot be created on the column `{}` which has data type {}",
-                    field.name(),
-                    field.data_type()
-                ),
-            });
+        index_opts: Index,
+    ) -> Result<Box<dyn lance::index::IndexParams>> {
+        match index_opts {
+            Index::IvfFlat(index) => {
+                if !supported_vector_data_type(field.data_type()) {
+                    return Err(Error::InvalidInput {
+                        message: format!(
+                            "An IVF Flat index cannot be created on the column `{}` which has data type {}",
+                            field.name(),
+                            field.data_type()
+                        ),
+                    });
+                }
+                let num_partitions = if let Some(n) = index.num_partitions {
+                    n
+                } else {
+                    suggested_num_partitions(self.count_rows(None).await?)
+                };
+                let lance_idx_params = lance::index::vector::VectorIndexParams::ivf_flat(
+                    num_partitions as usize,
+                    index.distance_type.into(),
+                );
+                Ok(Box::new(lance_idx_params))
+            }
+            // TODO: Add support for other index types
+            // Take the logic from the `create_*_index` methods, then eliminate
+            // the function. Do your best to avoid code duplication, espeically between
+            // the IVF* indices.
+            _ => {
+                todo!()
+            }
         }
-
-        let num_partitions = if let Some(n) = index.num_partitions {
-            n
-        } else {
-            suggested_num_partitions(self.count_rows(None).await?)
-        };
-        let mut dataset = self.dataset.get_mut().await?;
-        let lance_idx_params = lance::index::vector::VectorIndexParams::ivf_flat(
-            num_partitions as usize,
-            index.distance_type.into(),
-        );
-        dataset
-            .create_index(
-                &[field.name()],
-                IndexType::Vector,
-                None,
-                &lance_idx_params,
-                replace,
-            )
-            .await?;
-        Ok(())
     }
 
     async fn create_ivf_pq_index(
@@ -1895,15 +1894,17 @@ impl NativeTable {
         let lance_idx_params = lance_index::scalar::ScalarIndexParams {
             force_index_type: Some(lance_index::scalar::ScalarIndexType::BTree),
         };
-        dataset
-            .create_index(
-                &[field.name()],
-                IndexType::BTree,
-                None,
-                &lance_idx_params,
-                opts.replace,
-            )
-            .await?;
+        let columns = [field.name().as_str()];
+        let mut builder = dataset
+            .create_index_builder(&columns, IndexType::BTree, &lance_idx_params)
+            .train(opts.train)
+            .replace(opts.replace);
+
+        if let Some(name) = opts.name {
+            builder = builder.name(name);
+        }
+        builder.await?;
+
         Ok(())
     }
 
@@ -1922,15 +1923,18 @@ impl NativeTable {
         let lance_idx_params = lance_index::scalar::ScalarIndexParams {
             force_index_type: Some(lance_index::scalar::ScalarIndexType::Bitmap),
         };
-        dataset
-            .create_index(
-                &[field.name()],
-                IndexType::Bitmap,
-                None,
-                &lance_idx_params,
-                opts.replace,
-            )
-            .await?;
+
+        let columns = [field.name().as_str()];
+        let mut builder = dataset
+            .create_index_builder(&columns, IndexType::Bitmap, &lance_idx_params)
+            .train(opts.train)
+            .replace(opts.replace);
+
+        if let Some(name) = opts.name {
+            builder = builder.name(name);
+        }
+        builder.await?;
+
         Ok(())
     }
 
@@ -1949,23 +1953,24 @@ impl NativeTable {
         let lance_idx_params = lance_index::scalar::ScalarIndexParams {
             force_index_type: Some(lance_index::scalar::ScalarIndexType::LabelList),
         };
-        dataset
-            .create_index(
-                &[field.name()],
-                IndexType::LabelList,
-                None,
-                &lance_idx_params,
-                opts.replace,
-            )
-            .await?;
+        let columns = [field.name().as_str()];
+        let mut builder = dataset
+            .create_index_builder(&columns, IndexType::LabelList, &lance_idx_params)
+            .train(opts.train)
+            .replace(opts.replace);
+
+        if let Some(name) = opts.name {
+            builder = builder.name(name);
+        }
+        builder.await?;
+
         Ok(())
     }
 
     async fn create_fts_index(
         &self,
         field: &Field,
-        fts_opts: FtsIndexBuilder,
-        replace: bool,
+        opts: IndexBuilder,
     ) -> Result<()> {
         if !supported_fts_data_type(field.data_type()) {
             return Err(Error::Schema {
@@ -1978,15 +1983,32 @@ impl NativeTable {
         }
 
         let mut dataset = self.dataset.get_mut().await?;
+        let Index::FTS(fts_opts) = opts.index else {
+            return Err(Error::InvalidInput {
+                message: "FTS index requires FtsOptions".to_string(),
+            });
+        };
         dataset
             .create_index(
                 &[field.name()],
                 IndexType::Inverted,
                 None,
                 &fts_opts,
-                replace,
+                opts.replace,
             )
             .await?;
+
+        let columns = [field.name().as_str()];
+        let mut builder = dataset
+            .create_index_builder(&columns, IndexType::Inverted, &fts_opts)
+            .train(opts.train)
+            .replace(opts.replace);
+
+        if let Some(name) = opts.name {
+            builder = builder.name(name);
+        }
+        builder.await?;
+        
         Ok(())
     }
 
@@ -2202,26 +2224,18 @@ impl BaseTable for NativeTable {
 
         let field = schema.field_with_name(&opts.columns[0])?;
 
-        match opts.index {
-            Index::Auto => self.create_auto_index(field, opts).await,
-            Index::BTree(_) => self.create_btree_index(field, opts).await,
-            Index::Bitmap(_) => self.create_bitmap_index(field, opts).await,
-            Index::LabelList(_) => self.create_label_list_index(field, opts).await,
-            Index::FTS(fts_opts) => self.create_fts_index(field, fts_opts, opts.replace).await,
-            Index::IvfFlat(ivf_flat) => {
-                self.create_ivf_flat_index(ivf_flat, field, opts.replace)
-                    .await
-            }
-            Index::IvfPq(ivf_pq) => self.create_ivf_pq_index(ivf_pq, field, opts.replace).await,
-            Index::IvfHnswPq(ivf_hnsw_pq) => {
-                self.create_ivf_hnsw_pq_index(ivf_hnsw_pq, field, opts.replace)
-                    .await
-            }
-            Index::IvfHnswSq(ivf_hnsw_sq) => {
-                self.create_ivf_hnsw_sq_index(ivf_hnsw_sq, field, opts.replace)
-                    .await
-            }
+        let lance_idx_params = self.make_index_params(field, opts.index).await?;
+        let columns = [field.name().as_str()];
+        let mut dataset = self.dataset.get_mut().await?;
+        let mut builder = dataset
+            .create_index_builder(&columns, IndexType::Bitmap, lance_idx_params.as_ref())
+            .train(opts.train)
+            .replace(opts.replace);
+
+        if let Some(name) = opts.name {
+            builder = builder.name(name);
         }
+        Ok(builder.await?)
     }
 
     async fn drop_index(&self, index_name: &str) -> Result<()> {

@@ -71,6 +71,8 @@ pub struct IndexBuilder {
     pub(crate) columns: Vec<String>,
     pub(crate) replace: bool,
     pub(crate) wait_timeout: Option<Duration>,
+    pub(crate) train: bool,
+    pub(crate) name: Option<String>,
 }
 
 impl IndexBuilder {
@@ -80,7 +82,9 @@ impl IndexBuilder {
             index,
             columns,
             replace: true,
+            train: true,
             wait_timeout: None,
+            name: None,
         }
     }
 
@@ -91,6 +95,22 @@ impl IndexBuilder {
     /// that index is out of date.
     pub fn replace(mut self, v: bool) -> Self {
         self.replace = v;
+        self
+    }
+
+    /// The name of the index. If not set, a default name will be generated.
+    pub fn name(mut self, v: String) -> Self {
+        self.name = Some(v);
+        self
+    }
+
+    /// Whether to train the index, the default is `true`.
+    /// 
+    /// If this is false, the index will not be trained and just created empty.
+    ///
+    /// This is not supported for vector indices yet.
+    pub fn train(mut self, v: bool) -> Self {
+        self.train = v;
         self
     }
 
