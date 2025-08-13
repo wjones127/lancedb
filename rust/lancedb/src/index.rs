@@ -105,7 +105,7 @@ impl IndexBuilder {
     }
 
     /// Whether to train the index, the default is `true`.
-    /// 
+    ///
     /// If this is false, the index will not be trained and just created empty.
     ///
     /// This is not supported for vector indices yet.

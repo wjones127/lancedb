@@ -50,10 +50,7 @@ use crate::arrow::IntoArrow;
 use crate::connection::NoData;
 use crate::embeddings::{EmbeddingDefinition, EmbeddingRegistry, MaybeEmbedded, MemoryRegistry};
 use crate::error::{Error, Result};
-use crate::index::vector::{
-    suggested_num_partitions_for_hnsw, IvfFlatIndexBuilder, IvfHnswPqIndexBuilder,
-    IvfHnswSqIndexBuilder, IvfPqIndexBuilder, VectorIndex,
-};
+use crate::index::vector::{suggested_num_partitions_for_hnsw, VectorIndex};
 use crate::index::IndexStatistics;
 use crate::index::{
     vector::{suggested_num_partitions, suggested_num_sub_vectors},
@@ -1655,6 +1652,92 @@ impl NativeTable {
         index_opts: Index,
     ) -> Result<Box<dyn lance::index::IndexParams>> {
         match index_opts {
+            Index::Auto => {
+                if supported_vector_data_type(field.data_type()) {
+                    // Use IvfPq as the default for auto vector indices
+                    let lance_idx_params = lance::index::vector::VectorIndexParams::ivf_pq(
+                        suggested_num_partitions(self.count_rows(None).await?) as usize,
+                        /*num_bits=*/ 8,
+                        {
+                            let dim = infer_vector_dim(field.data_type())?;
+                            suggested_num_sub_vectors(dim as u32) as usize
+                        },
+                        lance_linalg::distance::MetricType::L2,
+                        50, // max_iterations
+                    );
+                    Ok(Box::new(lance_idx_params))
+                } else if supported_btree_data_type(field.data_type()) {
+                    let lance_idx_params = lance_index::scalar::ScalarIndexParams {
+                        force_index_type: Some(lance_index::scalar::ScalarIndexType::BTree),
+                    };
+                    Ok(Box::new(lance_idx_params))
+                } else {
+                    return Err(Error::InvalidInput {
+                        message: format!(
+                            "there are no indices supported for the field `{}` with the data type {}",
+                            field.name(),
+                            field.data_type()
+                        ),
+                    });
+                }
+            }
+            Index::BTree(_) => {
+                if !supported_btree_data_type(field.data_type()) {
+                    return Err(Error::Schema {
+                        message: format!(
+                            "A BTree index cannot be created on the field `{}` which has data type {}",
+                            field.name(),
+                            field.data_type()
+                        ),
+                    });
+                }
+                let lance_idx_params = lance_index::scalar::ScalarIndexParams {
+                    force_index_type: Some(lance_index::scalar::ScalarIndexType::BTree),
+                };
+                Ok(Box::new(lance_idx_params))
+            }
+            Index::Bitmap(_) => {
+                if !supported_bitmap_data_type(field.data_type()) {
+                    return Err(Error::Schema {
+                        message: format!(
+                            "A Bitmap index cannot be created on the field `{}` which has data type {}",
+                            field.name(),
+                            field.data_type()
+                        ),
+                    });
+                }
+                let lance_idx_params = lance_index::scalar::ScalarIndexParams {
+                    force_index_type: Some(lance_index::scalar::ScalarIndexType::Bitmap),
+                };
+                Ok(Box::new(lance_idx_params))
+            }
+            Index::LabelList(_) => {
+                if !supported_label_list_data_type(field.data_type()) {
+                    return Err(Error::Schema {
+                        message: format!(
+                            "A LabelList index cannot be created on the field `{}` which has data type {}",
+                            field.name(),
+                            field.data_type()
+                        ),
+                    });
+                }
+                let lance_idx_params = lance_index::scalar::ScalarIndexParams {
+                    force_index_type: Some(lance_index::scalar::ScalarIndexType::LabelList),
+                };
+                Ok(Box::new(lance_idx_params))
+            }
+            Index::FTS(fts_opts) => {
+                if !supported_fts_data_type(field.data_type()) {
+                    return Err(Error::Schema {
+                        message: format!(
+                            "A FTS index cannot be created on the field `{}` which has data type {}",
+                            field.name(),
+                            field.data_type()
+                        ),
+                    });
+                }
+                Ok(Box::new(fts_opts))
+            }
             Index::IvfFlat(index) => {
                 if !supported_vector_data_type(field.data_type()) {
                     return Err(Error::InvalidInput {
@@ -1676,340 +1759,175 @@ impl NativeTable {
                 );
                 Ok(Box::new(lance_idx_params))
             }
-            // TODO: Add support for other index types
-            // Take the logic from the `create_*_index` methods, then eliminate
-            // the function. Do your best to avoid code duplication, espeically between
-            // the IVF* indices.
-            _ => {
-                todo!()
+            Index::IvfPq(index) => {
+                if !supported_vector_data_type(field.data_type()) {
+                    return Err(Error::InvalidInput {
+                        message: format!(
+                            "An IVF PQ index cannot be created on the column `{}` which has data type {}",
+                            field.name(),
+                            field.data_type()
+                        ),
+                    });
+                }
+                let num_partitions = if let Some(n) = index.num_partitions {
+                    n
+                } else {
+                    suggested_num_partitions(self.count_rows(None).await?)
+                };
+                let num_sub_vectors: u32 = if let Some(n) = index.num_sub_vectors {
+                    n
+                } else {
+                    let dim = infer_vector_dim(field.data_type())?;
+                    suggested_num_sub_vectors(dim as u32)
+                };
+                let lance_idx_params = lance::index::vector::VectorIndexParams::ivf_pq(
+                    num_partitions as usize,
+                    /*num_bits=*/ 8,
+                    num_sub_vectors as usize,
+                    index.distance_type.into(),
+                    index.max_iterations as usize,
+                );
+                Ok(Box::new(lance_idx_params))
+            }
+            Index::IvfHnswPq(index) => {
+                if !supported_vector_data_type(field.data_type()) {
+                    return Err(Error::InvalidInput {
+                        message: format!(
+                            "An IVF HNSW PQ index cannot be created on the column `{}` which has data type {}",
+                            field.name(),
+                            field.data_type()
+                        ),
+                    });
+                }
+                let num_partitions: u32 = if let Some(n) = index.num_partitions {
+                    n
+                } else {
+                    match field.data_type() {
+                        arrow_schema::DataType::FixedSizeList(_, n) => {
+                            suggested_num_partitions_for_hnsw(
+                                self.count_rows(None).await?,
+                                *n as u32,
+                            )
+                        }
+                        _ => {
+                            return Err(Error::Schema {
+                                message: format!(
+                                    "Column '{}' is not a FixedSizeList",
+                                    field.name()
+                                ),
+                            })
+                        }
+                    }
+                };
+                let num_sub_vectors: u32 = if let Some(n) = index.num_sub_vectors {
+                    n
+                } else {
+                    match field.data_type() {
+                        arrow_schema::DataType::FixedSizeList(_, n) => {
+                            suggested_num_sub_vectors(*n as u32)
+                        }
+                        _ => {
+                            return Err(Error::Schema {
+                                message: format!(
+                                    "Column '{}' is not a FixedSizeList",
+                                    field.name()
+                                ),
+                            })
+                        }
+                    }
+                };
+                let mut ivf_params = IvfBuildParams::new(num_partitions as usize);
+                ivf_params.sample_rate = index.sample_rate as usize;
+                ivf_params.max_iters = index.max_iterations as usize;
+                let hnsw_params = HnswBuildParams::default()
+                    .num_edges(index.m as usize)
+                    .ef_construction(index.ef_construction as usize);
+                let pq_params = PQBuildParams {
+                    num_sub_vectors: num_sub_vectors as usize,
+                    ..Default::default()
+                };
+                let lance_idx_params =
+                    lance::index::vector::VectorIndexParams::with_ivf_hnsw_pq_params(
+                        index.distance_type.into(),
+                        ivf_params,
+                        hnsw_params,
+                        pq_params,
+                    );
+                Ok(Box::new(lance_idx_params))
+            }
+            Index::IvfHnswSq(index) => {
+                if !supported_vector_data_type(field.data_type()) {
+                    return Err(Error::InvalidInput {
+                        message: format!(
+                            "An IVF HNSW SQ index cannot be created on the column `{}` which has data type {}",
+                            field.name(),
+                            field.data_type()
+                        ),
+                    });
+                }
+                let num_partitions: u32 = if let Some(n) = index.num_partitions {
+                    n
+                } else {
+                    match field.data_type() {
+                        arrow_schema::DataType::FixedSizeList(_, n) => {
+                            suggested_num_partitions_for_hnsw(
+                                self.count_rows(None).await?,
+                                *n as u32,
+                            )
+                        }
+                        _ => {
+                            return Err(Error::Schema {
+                                message: format!(
+                                    "Column '{}' is not a FixedSizeList",
+                                    field.name()
+                                ),
+                            })
+                        }
+                    }
+                };
+                let mut ivf_params = IvfBuildParams::new(num_partitions as usize);
+                ivf_params.sample_rate = index.sample_rate as usize;
+                ivf_params.max_iters = index.max_iterations as usize;
+                let hnsw_params = HnswBuildParams::default()
+                    .num_edges(index.m as usize)
+                    .ef_construction(index.ef_construction as usize);
+                let sq_params = SQBuildParams {
+                    sample_rate: index.sample_rate as usize,
+                    ..Default::default()
+                };
+                let lance_idx_params =
+                    lance::index::vector::VectorIndexParams::with_ivf_hnsw_sq_params(
+                        index.distance_type.into(),
+                        ivf_params,
+                        hnsw_params,
+                        sq_params,
+                    );
+                Ok(Box::new(lance_idx_params))
             }
         }
     }
 
-    async fn create_ivf_pq_index(
-        &self,
-        index: IvfPqIndexBuilder,
-        field: &Field,
-        replace: bool,
-    ) -> Result<()> {
-        if !supported_vector_data_type(field.data_type()) {
-            return Err(Error::InvalidInput {
-                message: format!(
-                    "An IVF PQ index cannot be created on the column `{}` which has data type {}",
-                    field.name(),
-                    field.data_type()
-                ),
-            });
-        }
-
-        let num_partitions = if let Some(n) = index.num_partitions {
-            n
-        } else {
-            suggested_num_partitions(self.count_rows(None).await?)
-        };
-        let num_sub_vectors: u32 = if let Some(n) = index.num_sub_vectors {
-            n
-        } else {
-            let dim = infer_vector_dim(field.data_type())?;
-            suggested_num_sub_vectors(dim as u32)
-        };
-        let mut dataset = self.dataset.get_mut().await?;
-        let lance_idx_params = lance::index::vector::VectorIndexParams::ivf_pq(
-            num_partitions as usize,
-            /*num_bits=*/ 8,
-            num_sub_vectors as usize,
-            index.distance_type.into(),
-            index.max_iterations as usize,
-        );
-        dataset
-            .create_index(
-                &[field.name()],
-                IndexType::Vector,
-                None,
-                &lance_idx_params,
-                replace,
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn create_ivf_hnsw_pq_index(
-        &self,
-        index: IvfHnswPqIndexBuilder,
-        field: &Field,
-        replace: bool,
-    ) -> Result<()> {
-        if !supported_vector_data_type(field.data_type()) {
-            return Err(Error::InvalidInput {
-                message: format!(
-                    "An IVF HNSW PQ index cannot be created on the column `{}` which has data type {}",
-                    field.name(),
-                    field.data_type()
-                ),
-            });
-        }
-
-        let num_partitions: u32 = if let Some(n) = index.num_partitions {
-            n
-        } else {
-            match field.data_type() {
-                arrow_schema::DataType::FixedSizeList(_, n) => Ok::<u32, Error>(
-                    suggested_num_partitions_for_hnsw(self.count_rows(None).await?, *n as u32),
-                ),
-                _ => Err(Error::Schema {
-                    message: format!("Column '{}' is not a FixedSizeList", field.name()),
-                }),
-            }?
-        };
-
-        let num_sub_vectors: u32 = if let Some(n) = index.num_sub_vectors {
-            n
-        } else {
-            match field.data_type() {
-                arrow_schema::DataType::FixedSizeList(_, n) => {
-                    Ok::<u32, Error>(suggested_num_sub_vectors(*n as u32))
+    // Helper method to get the correct IndexType based on the Index variant and field data type
+    fn get_index_type_for_field(&self, field: &Field, index: &Index) -> IndexType {
+        match index {
+            Index::Auto => {
+                if supported_vector_data_type(field.data_type()) {
+                    IndexType::Vector
+                } else if supported_btree_data_type(field.data_type()) {
+                    IndexType::BTree
+                } else {
+                    // This should not happen since make_index_params would have failed
+                    IndexType::BTree
                 }
-                _ => Err(Error::Schema {
-                    message: format!("Column '{}' is not a FixedSizeList", field.name()),
-                }),
-            }?
-        };
-
-        let mut dataset = self.dataset.get_mut().await?;
-        let mut ivf_params = IvfBuildParams::new(num_partitions as usize);
-        ivf_params.sample_rate = index.sample_rate as usize;
-        ivf_params.max_iters = index.max_iterations as usize;
-        let hnsw_params = HnswBuildParams::default()
-            .num_edges(index.m as usize)
-            .ef_construction(index.ef_construction as usize);
-        let pq_params = PQBuildParams {
-            num_sub_vectors: num_sub_vectors as usize,
-            ..Default::default()
-        };
-        let lance_idx_params = lance::index::vector::VectorIndexParams::with_ivf_hnsw_pq_params(
-            index.distance_type.into(),
-            ivf_params,
-            hnsw_params,
-            pq_params,
-        );
-        dataset
-            .create_index(
-                &[field.name()],
-                IndexType::Vector,
-                None,
-                &lance_idx_params,
-                replace,
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn create_ivf_hnsw_sq_index(
-        &self,
-        index: IvfHnswSqIndexBuilder,
-        field: &Field,
-        replace: bool,
-    ) -> Result<()> {
-        if !supported_vector_data_type(field.data_type()) {
-            return Err(Error::InvalidInput {
-                message: format!(
-                    "An IVF HNSW SQ index cannot be created on the column `{}` which has data type {}",
-                    field.name(),
-                    field.data_type()
-                ),
-            });
+            }
+            Index::BTree(_) => IndexType::BTree,
+            Index::Bitmap(_) => IndexType::Bitmap,
+            Index::LabelList(_) => IndexType::LabelList,
+            Index::FTS(_) => IndexType::Inverted,
+            Index::IvfFlat(_) | Index::IvfPq(_) | Index::IvfHnswPq(_) | Index::IvfHnswSq(_) => {
+                IndexType::Vector
+            }
         }
-
-        let num_partitions: u32 = if let Some(n) = index.num_partitions {
-            n
-        } else {
-            match field.data_type() {
-                arrow_schema::DataType::FixedSizeList(_, n) => Ok::<u32, Error>(
-                    suggested_num_partitions_for_hnsw(self.count_rows(None).await?, *n as u32),
-                ),
-                _ => Err(Error::Schema {
-                    message: format!("Column '{}' is not a FixedSizeList", field.name()),
-                }),
-            }?
-        };
-
-        let mut dataset = self.dataset.get_mut().await?;
-        let mut ivf_params = IvfBuildParams::new(num_partitions as usize);
-        ivf_params.sample_rate = index.sample_rate as usize;
-        ivf_params.max_iters = index.max_iterations as usize;
-        let hnsw_params = HnswBuildParams::default()
-            .num_edges(index.m as usize)
-            .ef_construction(index.ef_construction as usize);
-        let sq_params = SQBuildParams {
-            sample_rate: index.sample_rate as usize,
-            ..Default::default()
-        };
-        let lance_idx_params = lance::index::vector::VectorIndexParams::with_ivf_hnsw_sq_params(
-            index.distance_type.into(),
-            ivf_params,
-            hnsw_params,
-            sq_params,
-        );
-        dataset
-            .create_index(
-                &[field.name()],
-                IndexType::Vector,
-                None,
-                &lance_idx_params,
-                replace,
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn create_auto_index(&self, field: &Field, opts: IndexBuilder) -> Result<()> {
-        if supported_vector_data_type(field.data_type()) {
-            self.create_ivf_pq_index(IvfPqIndexBuilder::default(), field, opts.replace)
-                .await
-        } else if supported_btree_data_type(field.data_type()) {
-            self.create_btree_index(field, opts).await
-        } else {
-            Err(Error::InvalidInput {
-                message: format!(
-                    "there are no indices supported for the field `{}` with the data type {}",
-                    field.name(),
-                    field.data_type()
-                ),
-            })
-        }
-    }
-
-    async fn create_btree_index(&self, field: &Field, opts: IndexBuilder) -> Result<()> {
-        if !supported_btree_data_type(field.data_type()) {
-            return Err(Error::Schema {
-                message: format!(
-                    "A BTree index cannot be created on the field `{}` which has data type {}",
-                    field.name(),
-                    field.data_type()
-                ),
-            });
-        }
-
-        let mut dataset = self.dataset.get_mut().await?;
-        let lance_idx_params = lance_index::scalar::ScalarIndexParams {
-            force_index_type: Some(lance_index::scalar::ScalarIndexType::BTree),
-        };
-        let columns = [field.name().as_str()];
-        let mut builder = dataset
-            .create_index_builder(&columns, IndexType::BTree, &lance_idx_params)
-            .train(opts.train)
-            .replace(opts.replace);
-
-        if let Some(name) = opts.name {
-            builder = builder.name(name);
-        }
-        builder.await?;
-
-        Ok(())
-    }
-
-    async fn create_bitmap_index(&self, field: &Field, opts: IndexBuilder) -> Result<()> {
-        if !supported_bitmap_data_type(field.data_type()) {
-            return Err(Error::Schema {
-                message: format!(
-                    "A Bitmap index cannot be created on the field `{}` which has data type {}",
-                    field.name(),
-                    field.data_type()
-                ),
-            });
-        }
-
-        let mut dataset = self.dataset.get_mut().await?;
-        let lance_idx_params = lance_index::scalar::ScalarIndexParams {
-            force_index_type: Some(lance_index::scalar::ScalarIndexType::Bitmap),
-        };
-
-        let columns = [field.name().as_str()];
-        let mut builder = dataset
-            .create_index_builder(&columns, IndexType::Bitmap, &lance_idx_params)
-            .train(opts.train)
-            .replace(opts.replace);
-
-        if let Some(name) = opts.name {
-            builder = builder.name(name);
-        }
-        builder.await?;
-
-        Ok(())
-    }
-
-    async fn create_label_list_index(&self, field: &Field, opts: IndexBuilder) -> Result<()> {
-        if !supported_label_list_data_type(field.data_type()) {
-            return Err(Error::Schema {
-                message: format!(
-                    "A LabelList index cannot be created on the field `{}` which has data type {}",
-                    field.name(),
-                    field.data_type()
-                ),
-            });
-        }
-
-        let mut dataset = self.dataset.get_mut().await?;
-        let lance_idx_params = lance_index::scalar::ScalarIndexParams {
-            force_index_type: Some(lance_index::scalar::ScalarIndexType::LabelList),
-        };
-        let columns = [field.name().as_str()];
-        let mut builder = dataset
-            .create_index_builder(&columns, IndexType::LabelList, &lance_idx_params)
-            .train(opts.train)
-            .replace(opts.replace);
-
-        if let Some(name) = opts.name {
-            builder = builder.name(name);
-        }
-        builder.await?;
-
-        Ok(())
-    }
-
-    async fn create_fts_index(
-        &self,
-        field: &Field,
-        opts: IndexBuilder,
-    ) -> Result<()> {
-        if !supported_fts_data_type(field.data_type()) {
-            return Err(Error::Schema {
-                message: format!(
-                    "A FTS index cannot be created on the field `{}` which has data type {}",
-                    field.name(),
-                    field.data_type()
-                ),
-            });
-        }
-
-        let mut dataset = self.dataset.get_mut().await?;
-        let Index::FTS(fts_opts) = opts.index else {
-            return Err(Error::InvalidInput {
-                message: "FTS index requires FtsOptions".to_string(),
-            });
-        };
-        dataset
-            .create_index(
-                &[field.name()],
-                IndexType::Inverted,
-                None,
-                &fts_opts,
-                opts.replace,
-            )
-            .await?;
-
-        let columns = [field.name().as_str()];
-        let mut builder = dataset
-            .create_index_builder(&columns, IndexType::Inverted, &fts_opts)
-            .train(opts.train)
-            .replace(opts.replace);
-
-        if let Some(name) = opts.name {
-            builder = builder.name(name);
-        }
-        builder.await?;
-        
-        Ok(())
     }
 
     async fn generic_query(
@@ -2224,18 +2142,20 @@ impl BaseTable for NativeTable {
 
         let field = schema.field_with_name(&opts.columns[0])?;
 
-        let lance_idx_params = self.make_index_params(field, opts.index).await?;
+        let lance_idx_params = self.make_index_params(field, opts.index.clone()).await?;
+        let index_type = self.get_index_type_for_field(field, &opts.index);
         let columns = [field.name().as_str()];
         let mut dataset = self.dataset.get_mut().await?;
         let mut builder = dataset
-            .create_index_builder(&columns, IndexType::Bitmap, lance_idx_params.as_ref())
+            .create_index_builder(&columns, index_type, lance_idx_params.as_ref())
             .train(opts.train)
             .replace(opts.replace);
 
         if let Some(name) = opts.name {
             builder = builder.name(name);
         }
-        Ok(builder.await?)
+        builder.await?;
+        Ok(())
     }
 
     async fn drop_index(&self, index_name: &str) -> Result<()> {
@@ -2862,6 +2782,7 @@ mod tests {
     use crate::connect;
     use crate::connection::ConnectBuilder;
     use crate::index::scalar::{BTreeIndexBuilder, BitmapIndexBuilder};
+    use crate::index::vector::{IvfHnswPqIndexBuilder, IvfHnswSqIndexBuilder};
     use crate::query::{ExecutableQuery, QueryBase};
 
     #[tokio::test]
