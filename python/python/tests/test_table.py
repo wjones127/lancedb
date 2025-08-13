@@ -699,6 +699,43 @@ def test_create_index_method(mock_create_index, mem_db: DBConnection):
     )
 
 
+@patch("lancedb.table.AsyncTable.create_index")
+def test_create_index_name_and_train_parameters(
+    mock_create_index, mem_db: DBConnection
+):
+    """Test that name and train parameters are passed correctly to AsyncTable"""
+    table = mem_db.create_table(
+        "test",
+        data=[
+            {"vector": [3.1, 4.1], "id": 1},
+            {"vector": [5.9, 26.5], "id": 2},
+        ],
+    )
+
+    # Test with custom name
+    table.create_index(vector_column_name="vector", name="my_custom_index")
+    expected_config = IvfPq()  # Default config
+    mock_create_index.assert_called_with(
+        "vector",
+        replace=True,
+        config=expected_config,
+        name="my_custom_index",
+        train=None,
+    )
+
+    # Test with train=False
+    table.create_index(vector_column_name="vector", train=False)
+    mock_create_index.assert_called_with(
+        "vector", replace=True, config=expected_config, name=None, train=False
+    )
+
+    # Test with both name and train
+    table.create_index(vector_column_name="vector", name="my_index_name", train=True)
+    mock_create_index.assert_called_with(
+        "vector", replace=True, config=expected_config, name="my_index_name", train=True
+    )
+
+
 def test_add_with_nans(mem_db: DBConnection):
     # by default we raise an error on bad input vectors
     bad_data = [
