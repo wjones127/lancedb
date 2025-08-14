@@ -670,7 +670,9 @@ def test_create_index_method(mock_create_index, mem_db: DBConnection):
         num_sub_vectors=96,
         num_bits=4,
     )
-    mock_create_index.assert_called_with("vector", replace=True, config=expected_config)
+    mock_create_index.assert_called_with(
+        "vector", replace=True, config=expected_config, name=None, train=True
+    )
 
     table.create_index(
         vector_column_name="my_vector",
@@ -680,7 +682,7 @@ def test_create_index_method(mock_create_index, mem_db: DBConnection):
     )
     expected_config = HnswPq(distance_type="dot")
     mock_create_index.assert_called_with(
-        "my_vector", replace=False, config=expected_config
+        "my_vector", replace=False, config=expected_config, name=None, train=True
     )
 
     table.create_index(
@@ -695,7 +697,7 @@ def test_create_index_method(mock_create_index, mem_db: DBConnection):
         distance_type="cosine", sample_rate=0.1, m=29, ef_construction=10
     )
     mock_create_index.assert_called_with(
-        "my_vector", replace=True, config=expected_config
+        "my_vector", replace=True, config=expected_config, name=None, train=True
     )
 
 
@@ -720,7 +722,7 @@ def test_create_index_name_and_train_parameters(
         replace=True,
         config=expected_config,
         name="my_custom_index",
-        train=None,
+        train=True,
     )
 
     # Test with train=False

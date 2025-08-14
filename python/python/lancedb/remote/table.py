@@ -195,7 +195,7 @@ class RemoteTable(Table):
         *,
         num_bits: int = 8,
         name: Optional[str] = None,
-        train: Optional[bool] = None,
+        train: bool = True,
     ):
         """Create an index on the table.
         Currently, the only parameters that matter are

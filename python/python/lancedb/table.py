@@ -688,7 +688,7 @@ class Table(ABC):
         m: int = 20,
         ef_construction: int = 300,
         name: Optional[str] = None,
-        train: Optional[bool] = None,
+        train: bool = True,
     ):
         """Create an index on the table.
 
@@ -723,9 +723,9 @@ class Table(ABC):
             The timeout to wait if indexing is asynchronous.
         name: str, optional
             The name of the index. If not provided, a default name will be generated.
-        train: bool, optional
-            Whether to train the index with existing data. If not provided, defaults
-            to True for scalar indices. Vector indices always train with existing data.
+        train: bool, default True
+            Whether to train the index with existing data. Vector indices always train
+            with existing data.
         """
         raise NotImplementedError
 
@@ -1870,7 +1870,7 @@ class LanceTable(Table):
         ef_construction: int = 300,
         *,
         name: Optional[str] = None,
-        train: Optional[bool] = None,
+        train: bool = True,
     ):
         """Create an index on the table."""
         if accelerator is not None:
@@ -3196,7 +3196,7 @@ class AsyncTable:
         ] = None,
         wait_timeout: Optional[timedelta] = None,
         name: Optional[str] = None,
-        train: Optional[bool] = None,
+        train: bool = True,
     ):
         """Create an index to speed up queries
 
@@ -3225,9 +3225,9 @@ class AsyncTable:
             The timeout to wait if indexing is asynchronous.
         name: str, optional
             The name of the index. If not provided, a default name will be generated.
-        train: bool, optional
-            Whether to train the index with existing data. If not provided, defaults
-            to True for scalar indices. Vector indices always train with existing data.
+        train: bool, default True
+            Whether to train the index with existing data. Vector indices always train
+            with existing data.
         """
         if config is not None:
             if not isinstance(
