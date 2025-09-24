@@ -1942,19 +1942,23 @@ def test_update_metadata(mem_db: DBConnection):
         "test_metadata",
         data=[{"vector": [1.1, 0.9], "id": 0}, {"vector": [1.2, 1.9], "id": 1}],
     )
-    
+
     # Add initial metadata
     result = table.update_metadata({"description": "Test table", "version": "1.0"})
     assert result == {"description": "Test table", "version": "1.0"}
-    
+
     # Update existing and add new metadata
     result = table.update_metadata({"version": "1.1", "author": "test_user"})
-    assert result == {"description": "Test table", "version": "1.1", "author": "test_user"}
-    
+    assert result == {
+        "description": "Test table",
+        "version": "1.1",
+        "author": "test_user",
+    }
+
     # Remove a key
     result = table.update_metadata({"author": None})
     assert result == {"description": "Test table", "version": "1.1"}
-    
+
     # Replace all metadata
     result = table.update_metadata({"new_field": "new_value"}, replace=True)
     assert result == {"new_field": "new_value"}
@@ -1966,15 +1970,17 @@ def test_update_schema_metadata(mem_db: DBConnection):
         "test_schema_metadata",
         data=[{"vector": [1.1, 0.9], "id": 0}, {"vector": [1.2, 1.9], "id": 1}],
     )
-    
+
     # Add schema metadata
-    result = table.update_schema_metadata({"format_version": "2.0", "encoding": "utf-8"})
+    result = table.update_schema_metadata(
+        {"format_version": "2.0", "encoding": "utf-8"}
+    )
     assert result == {"format_version": "2.0", "encoding": "utf-8"}
-    
+
     # Update existing metadata
     result = table.update_schema_metadata({"format_version": "2.1"})
     assert result == {"format_version": "2.1", "encoding": "utf-8"}
-    
+
     # Remove a key
     result = table.update_schema_metadata({"encoding": None})
     assert result == {"format_version": "2.1"}
@@ -1987,14 +1993,20 @@ async def test_update_metadata_async(mem_db_async: AsyncConnection):
         "test_metadata_async",
         data=[{"vector": [1.1, 0.9], "id": 0}, {"vector": [1.2, 1.9], "id": 1}],
     )
-    
+
     # Add initial metadata
-    result = await table.update_metadata({"description": "Async test table", "version": "1.0"})
+    result = await table.update_metadata(
+        {"description": "Async test table", "version": "1.0"}
+    )
     assert result == {"description": "Async test table", "version": "1.0"}
-    
+
     # Update metadata
     result = await table.update_metadata({"version": "2.0", "async": "true"})
-    assert result == {"description": "Async test table", "version": "2.0", "async": "true"}
+    assert result == {
+        "description": "Async test table",
+        "version": "2.0",
+        "async": "true",
+    }
 
 
 @pytest.mark.asyncio
@@ -2004,11 +2016,11 @@ async def test_update_schema_metadata_async(mem_db_async: AsyncConnection):
         "test_schema_metadata_async",
         data=[{"vector": [1.1, 0.9], "id": 0}, {"vector": [1.2, 1.9], "id": 1}],
     )
-    
+
     # Add schema metadata
     result = await table.update_schema_metadata({"format_version": "3.0"})
     assert result == {"format_version": "3.0"}
-    
+
     # Replace schema metadata
     result = await table.update_schema_metadata({"new_format": "json"}, replace=True)
     assert result == {"new_format": "json"}
