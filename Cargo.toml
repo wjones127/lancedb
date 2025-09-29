@@ -23,7 +23,7 @@ lance-table = { "path" = "../lance/rust/lance-table" }
 lance-testing = { "path" = "../lance/rust/lance-testing" }
 lance-datafusion = { "path" = "../lance/rust/lance-datafusion" }
 lance-encoding = { "path" = "../lance/rust/lance-encoding" }
-lance-namespace = "0.0.15"
+lance-namespace = { "path" = "../lance-namespace/rust/lance-namespace" }
 # Note that this one does not include pyarrow
 arrow = { version = "55.1", optional = false }
 arrow-array = "55.1"
