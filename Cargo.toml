@@ -15,14 +15,14 @@ categories = ["database-implementations"]
 rust-version = "1.78.0"
 
 [workspace.dependencies]
-lance = { "version" = "=0.37.0", default-features = false, "features" = ["dynamodb"], "tag" = "v0.37.1-beta.1", "git" = "https://github.com/lancedb/lance.git" }
-lance-io = { "version" = "=0.37.0", default-features = false, "tag" = "v0.37.1-beta.1", "git" = "https://github.com/lancedb/lance.git" }
-lance-index = { "version" = "=0.37.0", "tag" = "v0.37.1-beta.1", "git" = "https://github.com/lancedb/lance.git" }
-lance-linalg = { "version" = "=0.37.0", "tag" = "v0.37.1-beta.1", "git" = "https://github.com/lancedb/lance.git" }
-lance-table = { "version" = "=0.37.0", "tag" = "v0.37.1-beta.1", "git" = "https://github.com/lancedb/lance.git" }
-lance-testing = { "version" = "=0.37.0", "tag" = "v0.37.1-beta.1", "git" = "https://github.com/lancedb/lance.git" }
-lance-datafusion = { "version" = "=0.37.0", "tag" = "v0.37.1-beta.1", "git" = "https://github.com/lancedb/lance.git" }
-lance-encoding = { "version" = "=0.37.0", "tag" = "v0.37.1-beta.1", "git" = "https://github.com/lancedb/lance.git" }
+lance = { "path" = "../lance/rust/lance", default-features = false, "features" = ["dynamodb"] }
+lance-io = { "path" = "../lance/rust/lance-io", default-features = false }
+lance-index = { "path" = "../lance/rust/lance-index" }
+lance-linalg = { "path" = "../lance/rust/lance-linalg" }
+lance-table = { "path" = "../lance/rust/lance-table" }
+lance-testing = { "path" = "../lance/rust/lance-testing" }
+lance-datafusion = { "path" = "../lance/rust/lance-datafusion" }
+lance-encoding = { "path" = "../lance/rust/lance-encoding" }
 lance-namespace = "0.0.15"
 # Note that this one does not include pyarrow
 arrow = { version = "55.1", optional = false }
