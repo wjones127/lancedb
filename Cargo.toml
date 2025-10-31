@@ -15,14 +15,14 @@ categories = ["database-implementations"]
 rust-version = "1.78.0"
 
 [workspace.dependencies]
-lance = { "version" = "=0.38.2", default-features = false, "features" = ["dynamodb"] }
-lance-io = { "version" = "=0.38.2", default-features = false }
-lance-index = "=0.38.2"
-lance-linalg = "=0.38.2"
-lance-table = "=0.38.2"
-lance-testing = "=0.38.2"
-lance-datafusion = "=0.38.2"
-lance-encoding = "=0.38.2"
+lance = { "path" = "../lance/rust/lance", default-features = false, "features" = ["dynamodb"] }
+lance-io = { "path" = "../lance/rust/lance-io", default-features = false }
+lance-index = { "path" = "../lance/rust/lance-index" }
+lance-linalg = { "path" = "../lance/rust/lance-linalg" }
+lance-table = { "path" = "../lance/rust/lance-table" }
+lance-testing = { "path" = "../lance/rust/lance-testing" }
+lance-datafusion = { "path" = "../lance/rust/lance-datafusion" }
+lance-encoding = { "path" = "../lance/rust/lance-encoding" }
 lance-namespace = "0.0.18"
 # Note that this one does not include pyarrow
 arrow = { version = "56.2", optional = false }
