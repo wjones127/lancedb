@@ -273,6 +273,20 @@ pub struct WriteOptions {
     pub lance_write_params: Option<WriteParams>,
 }
 
+/// Progress information for write operations like [`Table::add`].
+///
+/// This struct is passed to progress callbacks to report the current state
+/// of the write operation.
+#[derive(Debug, Clone)]
+pub struct WriteProgress {
+    /// Number of rows written so far.
+    pub rows_written: usize,
+    /// Approximate bytes written so far (based on Arrow batch memory size).
+    pub bytes_written: usize,
+    /// Elapsed time since the operation started.
+    pub elapsed: std::time::Duration,
+}
+
 #[derive(Debug, Clone, Default)]
 pub enum AddDataMode {
     /// Rows will be appended to the table (the default)
@@ -290,6 +304,7 @@ pub struct AddDataBuilder<T: IntoArrow> {
     pub(crate) mode: AddDataMode,
     pub(crate) write_options: WriteOptions,
     embedding_registry: Option<Arc<dyn EmbeddingRegistry>>,
+    pub(crate) progress_callback: Option<Arc<dyn Fn(WriteProgress) + Send + Sync>>,
 }
 
 impl<T: IntoArrow> std::fmt::Debug for AddDataBuilder<T> {
@@ -313,6 +328,31 @@ impl<T: IntoArrow> AddDataBuilder<T> {
         self
     }
 
+    /// Set a callback function to receive progress updates during the write operation.
+    ///
+    /// The callback will be invoked after each batch is written with information about
+    /// the cumulative progress.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use lancedb::WriteProgress;
+    ///
+    /// table.add(data)
+    ///     .progress_callback(|progress: WriteProgress| {
+    ///         println!("Wrote {} rows", progress.rows_written);
+    ///     })
+    ///     .execute()
+    ///     .await?;
+    /// ```
+    pub fn progress_callback(
+        mut self,
+        callback: impl Fn(WriteProgress) + Send + Sync + 'static,
+    ) -> Self {
+        self.progress_callback = Some(Arc::new(callback));
+        self
+    }
+
     pub async fn execute(self) -> Result<AddResult> {
         let parent = self.parent.clone();
         let data = self.data.into_arrow()?;
@@ -322,8 +362,67 @@ impl<T: IntoArrow> AddDataBuilder<T> {
             parent: self.parent,
             write_options: self.write_options,
             embedding_registry: self.embedding_registry,
+            progress_callback: self.progress_callback,
         };
         parent.add(without_data, data).await
+    }
+}
+
+/// A [`RecordBatchReader`] wrapper that tracks progress and reports it via a callback.
+///
+/// This is used internally by [`AddDataBuilder`] to report progress during write operations.
+pub(crate) struct ProgressTrackingReader {
+    inner: Box<dyn RecordBatchReader + Send>,
+    callback: Arc<dyn Fn(WriteProgress) + Send + Sync>,
+    schema: SchemaRef,
+    rows_written: usize,
+    bytes_written: usize,
+    start_time: std::time::Instant,
+}
+
+impl ProgressTrackingReader {
+    pub fn new(
+        inner: Box<dyn RecordBatchReader + Send>,
+        callback: Arc<dyn Fn(WriteProgress) + Send + Sync>,
+    ) -> Self {
+        let schema = inner.schema();
+        Self {
+            inner,
+            callback,
+            schema,
+            rows_written: 0,
+            bytes_written: 0,
+            start_time: std::time::Instant::now(),
+        }
+    }
+
+    fn report_progress(&self) {
+        let progress = WriteProgress {
+            rows_written: self.rows_written,
+            bytes_written: self.bytes_written,
+            elapsed: self.start_time.elapsed(),
+        };
+        (self.callback)(progress);
+    }
+}
+
+impl Iterator for ProgressTrackingReader {
+    type Item = std::result::Result<arrow_array::RecordBatch, arrow_schema::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let batch = self.inner.next()?;
+        if let Ok(b) = &batch {
+            self.rows_written += b.num_rows();
+            self.bytes_written += b.get_array_memory_size();
+            self.report_progress();
+        }
+        Some(batch)
+    }
+}
+
+impl RecordBatchReader for ProgressTrackingReader {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 }
 
@@ -789,6 +888,7 @@ impl Table {
             mode: AddDataMode::Append,
             write_options: WriteOptions::default(),
             embedding_registry: Some(self.embedding_registry.clone()),
+            progress_callback: None,
         }
     }
 
@@ -2740,6 +2840,14 @@ impl BaseTable for NativeTable {
             self.table_definition().await?,
             add.embedding_registry,
         )?) as Box<dyn RecordBatchReader + Send>;
+
+        // Wrap with progress tracking if a callback is provided
+        let data: Box<dyn RecordBatchReader + Send> = if let Some(callback) = add.progress_callback
+        {
+            Box::new(ProgressTrackingReader::new(data, callback))
+        } else {
+            data
+        };
 
         let lance_params = add.write_options.lance_write_params.unwrap_or(WriteParams {
             mode: match add.mode {
@@ -5194,5 +5302,61 @@ mod tests {
 
         // Should have an empty vector
         assert!(ns_request.vector.single_vector.as_ref().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_with_progress_callback() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Mutex;
+
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let conn = connect(uri).execute().await.unwrap();
+        let table = conn
+            .create_table("test_progress", make_test_batches())
+            .execute()
+            .await
+            .unwrap();
+
+        let progress_updates: Arc<Mutex<Vec<WriteProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let callback_count = Arc::new(AtomicUsize::new(0));
+
+        let progress_updates_clone = progress_updates.clone();
+        let callback_count_clone = callback_count.clone();
+
+        table
+            .add(make_test_batches())
+            .progress_callback(move |prog| {
+                progress_updates_clone.lock().unwrap().push(prog);
+                callback_count_clone.fetch_add(1, Ordering::SeqCst);
+            })
+            .execute()
+            .await
+            .unwrap();
+
+        let updates = progress_updates.lock().unwrap();
+        assert!(!updates.is_empty(), "Should have received progress updates");
+        assert!(
+            callback_count.load(Ordering::SeqCst) > 0,
+            "Callback should have been called"
+        );
+
+        // Verify progress is monotonically increasing
+        for i in 1..updates.len() {
+            assert!(
+                updates[i].rows_written >= updates[i - 1].rows_written,
+                "rows_written should be monotonically increasing"
+            );
+            assert!(
+                updates[i].bytes_written >= updates[i - 1].bytes_written,
+                "bytes_written should be monotonically increasing"
+            );
+        }
+
+        // Final update should have written some rows
+        let last = updates.last().unwrap();
+        assert!(last.rows_written > 0, "Should have written some rows");
+        assert!(last.bytes_written > 0, "Should have written some bytes");
     }
 }

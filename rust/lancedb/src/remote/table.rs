@@ -52,7 +52,7 @@ use crate::{
     query::QueryExecutionOptions,
     table::{
         merge::MergeInsertBuilder, AddDataBuilder, BaseTable, OptimizeAction, OptimizeStats,
-        TableDefinition, UpdateBuilder,
+        ProgressTrackingReader, TableDefinition, UpdateBuilder,
     },
 };
 
@@ -796,6 +796,15 @@ impl<S: HttpSend> BaseTable for RemoteTable<S> {
         data: Box<dyn RecordBatchReader + Send>,
     ) -> Result<AddResult> {
         self.check_mutable().await?;
+
+        // Wrap with progress tracking if a callback is provided
+        let data: Box<dyn RecordBatchReader + Send> = if let Some(callback) = add.progress_callback
+        {
+            Box::new(ProgressTrackingReader::new(data, callback))
+        } else {
+            data
+        };
+
         let mut request = self
             .client
             .post(&format!("/v1/table/{}/insert/", self.identifier))

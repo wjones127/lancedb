@@ -14,6 +14,7 @@ from functools import cached_property
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Iterable,
     List,
@@ -57,6 +58,7 @@ from .index import (
     FTS,
 )
 from .merge import LanceMergeInsertBuilder
+from .progress import WriteProgress, make_progress_callback
 from .pydantic import LanceModel, model_to_dict
 from .query import (
     AsyncFTSQuery,
@@ -970,6 +972,7 @@ class Table(ABC):
         mode: AddMode = "append",
         on_bad_vectors: OnBadVectorsType = "error",
         fill_value: float = 0.0,
+        progress: Optional[Union[Callable[[WriteProgress], None], Any]] = None,
     ) -> AddResult:
         """Add more data to the [Table](Table).
 
@@ -991,6 +994,10 @@ class Table(ABC):
             One of "error", "drop", "fill".
         fill_value: float, default 0.
             The value to use when filling vectors. Only used if on_bad_vectors="fill".
+        progress: Callable or tqdm-like, optional
+            A progress callback or tqdm progress bar. If provided, it will be called
+            with a WriteProgress dict containing rows_written, bytes_written, and
+            elapsed_secs after each batch is written.
 
         Returns
         -------
@@ -2406,6 +2413,7 @@ class LanceTable(Table):
         mode: AddMode = "append",
         on_bad_vectors: OnBadVectorsType = "error",
         fill_value: float = 0.0,
+        progress: Optional[Union[Callable[[WriteProgress], None], Any]] = None,
     ) -> AddResult:
         """Add data to the table.
         If vector columns are missing and the table
@@ -2424,15 +2432,23 @@ class LanceTable(Table):
             One of "error", "drop", "fill", "null".
         fill_value: float, default 0.
             The value to use when filling vectors. Only used if on_bad_vectors="fill".
+        progress: Callable or tqdm-like, optional
+            A progress callback or tqdm progress bar. If provided, it will be called
+            with a WriteProgress dict containing rows_written, bytes_written, and
+            elapsed_secs after each batch is written.
 
         Returns
         -------
-        int
-            The number of vectors in the table.
+        AddResult
+            An object containing the new version number of the table after adding data.
         """
         return LOOP.run(
             self._table.add(
-                data, mode=mode, on_bad_vectors=on_bad_vectors, fill_value=fill_value
+                data,
+                mode=mode,
+                on_bad_vectors=on_bad_vectors,
+                fill_value=fill_value,
+                progress=progress,
             )
         )
 
@@ -3613,6 +3629,7 @@ class AsyncTable:
         mode: Optional[Literal["append", "overwrite"]] = "append",
         on_bad_vectors: Optional[OnBadVectorsType] = None,
         fill_value: Optional[float] = None,
+        progress: Optional[Union[Callable[[WriteProgress], None], Any]] = None,
     ) -> AddResult:
         """Add more data to the [Table](Table).
 
@@ -3634,6 +3651,16 @@ class AsyncTable:
             One of "error", "drop", "fill", "null".
         fill_value: float, default 0.
             The value to use when filling vectors. Only used if on_bad_vectors="fill".
+        progress: Callable or tqdm-like, optional
+            A progress callback or tqdm progress bar. If provided, it will be called
+            with a WriteProgress dict containing rows_written, bytes_written, and
+            elapsed_secs after each batch is written.
+
+        Examples
+        --------
+        >>> from tqdm import tqdm
+        >>> async with tqdm(unit="rows") as pbar:
+        ...     await table.add(data, progress=pbar)
 
         """
         schema = await self.schema()
@@ -3652,7 +3679,8 @@ class AsyncTable:
         if isinstance(data, pa.Table):
             data = data.to_reader()
 
-        return await self._inner.add(data, mode or "append")
+        callback = make_progress_callback(progress)
+        return await self._inner.add(data, mode or "append", callback)
 
     def merge_insert(self, on: Union[str, Iterable[str]]) -> LanceMergeInsertBuilder:
         """

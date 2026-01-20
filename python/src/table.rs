@@ -15,13 +15,13 @@ use arrow::{
 };
 use lancedb::table::{
     AddDataMode, ColumnAlteration, Duration, NewColumnTransform, OptimizeAction, OptimizeOptions,
-    Table as LanceDbTable,
+    Table as LanceDbTable, WriteProgress,
 };
 use pyo3::{
     exceptions::{PyKeyError, PyRuntimeError, PyValueError},
     pyclass, pymethods,
     types::{IntoPyDict, PyAnyMethods, PyDict, PyDictMethods},
-    Bound, FromPyObject, PyAny, PyRef, PyResult, Python,
+    Bound, FromPyObject, PyAny, PyObject, PyRef, PyResult, Python,
 };
 use pyo3_async_runtimes::tokio::future_into_py;
 
@@ -291,10 +291,12 @@ impl Table {
         })
     }
 
+    #[pyo3(signature = (data, mode, progress=None))]
     pub fn add<'a>(
         self_: PyRef<'a, Self>,
         data: Bound<'_, PyAny>,
         mode: String,
+        progress: Option<PyObject>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let batches = ArrowArrayStreamReader::from_pyarrow_bound(&data)?;
         let mut op = self_.inner_ref()?.add(batches);
@@ -304,6 +306,23 @@ impl Table {
             op = op.mode(AddDataMode::Overwrite);
         } else {
             return Err(PyValueError::new_err(format!("Invalid mode: {}", mode)));
+        }
+
+        // Set up progress callback if provided
+        if let Some(py_callback) = progress {
+            let callback = move |prog: WriteProgress| {
+                Python::with_gil(|py| {
+                    let dict = PyDict::new(py);
+                    dict.set_item("rows_written", prog.rows_written).ok();
+                    dict.set_item("bytes_written", prog.bytes_written).ok();
+                    dict.set_item("elapsed_secs", prog.elapsed.as_secs_f64())
+                        .ok();
+                    if let Err(e) = py_callback.call1(py, (dict,)) {
+                        eprintln!("Progress callback error: {}", e);
+                    }
+                });
+            };
+            op = op.progress_callback(callback);
         }
 
         future_into_py(self_.py(), async move {

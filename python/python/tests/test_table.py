@@ -1967,3 +1967,65 @@ def test_add_table_with_empty_embeddings(tmp_path):
         on_bad_vectors="drop",
     )
     assert table.count_rows() == 1
+
+
+def test_add_with_progress_callback(tmp_path):
+    """Test that progress callback is invoked during add()."""
+    db = lancedb.connect(tmp_path)
+    data = [{"id": i, "vector": [float(i)] * 4} for i in range(100)]
+    table = db.create_table("test_progress", data=data[:10])
+
+    progress_updates = []
+
+    def on_progress(prog):
+        progress_updates.append(prog)
+
+    table.add(data[10:], progress=on_progress)
+
+    assert len(progress_updates) > 0, "Should have received progress updates"
+
+    # Verify progress dict has expected keys
+    assert "rows_written" in progress_updates[0]
+    assert "bytes_written" in progress_updates[0]
+    assert "elapsed_secs" in progress_updates[0]
+
+    # Verify monotonic progress
+    for i in range(1, len(progress_updates)):
+        assert (
+            progress_updates[i]["rows_written"]
+            >= progress_updates[i - 1]["rows_written"]
+        )
+
+    # Verify final count
+    assert table.count_rows() == 100
+
+
+def test_add_with_tqdm_adapter(tmp_path):
+    """Test that tqdm-like adapter works correctly."""
+    from lancedb.progress import TqdmProgressAdapter
+
+    db = lancedb.connect(tmp_path)
+    data = [{"id": i, "vector": [float(i)] * 4} for i in range(100)]
+    table = db.create_table("test_tqdm", data=data[:10])
+
+    # Mock tqdm-like progress bar
+    class MockProgressBar:
+        def __init__(self):
+            self.total_updated = 0
+            self.postfix = {}
+
+        def update(self, n=1):
+            self.total_updated += n
+
+        def set_postfix(self, **kwargs):
+            self.postfix = kwargs
+
+    mock_pbar = MockProgressBar()
+    adapter = TqdmProgressAdapter(mock_pbar)
+
+    table.add(data[10:], progress=adapter)
+
+    assert mock_pbar.total_updated == 90, (
+        f"Expected 90 rows, got {mock_pbar.total_updated}"
+    )
+    assert table.count_rows() == 100
