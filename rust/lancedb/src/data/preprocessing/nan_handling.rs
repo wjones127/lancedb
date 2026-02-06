@@ -813,6 +813,47 @@ mod tests {
         assert!(!fsl.is_null(1));
     }
 
+    #[tokio::test]
+    async fn test_nan_fill_fsl_f16_preserves_type() {
+        use half::f16;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vec",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float16, true)), 2),
+            true,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![{
+                use arrow_array::builder::{FixedSizeListBuilder, Float16Builder};
+                let mut builder = FixedSizeListBuilder::new(Float16Builder::with_capacity(4), 2);
+                builder.values().append_value(f16::from_f32(1.0));
+                builder.values().append_value(f16::NAN);
+                builder.append(true);
+                builder.values().append_value(f16::from_f32(3.0));
+                builder.values().append_value(f16::from_f32(4.0));
+                builder.append(true);
+                Arc::new(builder.finish()) as ArrayRef
+            }],
+        )
+        .unwrap();
+
+        let stream = make_stream(schema.clone(), vec![batch]);
+        let mut stream = handle_nan_vectors(stream, &NanStrategy::Fill(0.0));
+        let result_batch = stream.try_next().await.unwrap().unwrap();
+        assert_eq!(result_batch.schema(), schema);
+        let fsl = result_batch.column(0).as_fixed_size_list();
+        let row0 = fsl.value(0);
+        let row0_f16 = row0.as_primitive::<Float16Type>();
+        assert_eq!(row0_f16.value(0).to_f32(), 1.0);
+        assert_eq!(row0_f16.value(1).to_f32(), 0.0); // was NaN, now filled
+        let row1 = fsl.value(1);
+        let row1_f16 = row1.as_primitive::<Float16Type>();
+        assert_eq!(row1_f16.value(0).to_f32(), 3.0);
+        assert_eq!(row1_f16.value(1).to_f32(), 4.0);
+    }
+
     // -----------------------------------------------------------------------
     // List / LargeList tests
     // -----------------------------------------------------------------------
@@ -1103,9 +1144,7 @@ mod tests {
             match row {
                 Some(vals) => {
                     for v in vals {
-                        builder
-                            .values()
-                            .append_value(half::f16::from_f32(*v));
+                        builder.values().append_value(half::f16::from_f32(*v));
                     }
                     builder.append(true);
                 }
