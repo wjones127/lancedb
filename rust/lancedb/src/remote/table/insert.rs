@@ -100,6 +100,7 @@ impl<S: HttpSend + 'static> RemoteInsertExec<S> {
                         let num_rows = batch.num_rows();
                         writer.write(&batch)?;
                         let buffer = std::mem::take(writer.get_mut());
+                        // Reports serialized IPC byte count, not in-memory size.
                         if let Some(ref progress) = progress {
                             progress.report(num_rows, buffer.len());
                         }
@@ -452,56 +453,58 @@ mod tests {
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
     }
 
-    /// Tests that the progress callback is invoked with correct cumulative
-    /// counts when IPC-serialized batches flow through `stream_as_body`.
+    /// Unit-tests `stream_as_body` directly by consuming the reqwest body
+    /// stream and verifying the progress callback received correct cumulative
+    /// row and byte counts.
     #[tokio::test]
     async fn test_remote_insert_with_progress() {
-        use crate::table::add_data::WriteProgress;
+        use crate::table::add_data::{WriteProgress, WriteProgressState};
+        use datafusion_execution::SendableRecordBatchStream;
+        use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
         use std::sync::Mutex;
 
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let request_count_clone = request_count.clone();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            true,
+        )]));
 
-        let table = Table::new_with_handler("my_table", move |request| {
-            let path = request.url().path();
+        let batches = vec![
+            record_batch!(("id", Int32, [1, 2])).unwrap(),
+            record_batch!(("id", Int32, [3, 4])).unwrap(),
+        ];
+        let stream = futures::stream::iter(batches.into_iter().map(Ok));
+        let record_batch_stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream));
 
-            if path == "/v1/table/my_table/describe/" {
-                return http::Response::builder()
-                    .status(200)
-                    .body(format!(r#"{{"version": 1, "schema": {}}}"#, schema_json()))
-                    .unwrap();
-            }
-
-            if path == "/v1/table/my_table/insert/" {
-                request_count_clone.fetch_add(1, Ordering::SeqCst);
-                return http::Response::builder()
-                    .status(200)
-                    .body(r#"{"version": 2}"#.to_string())
-                    .unwrap();
-            }
-
-            panic!("Unexpected request path: {}", path);
-        });
-
-        // Verify progress wiring by checking that WriteProgressState is
-        // correctly constructed from the callback.
         let updates: Arc<Mutex<Vec<WriteProgress>>> = Arc::new(Mutex::new(Vec::new()));
         let updates_clone = updates.clone();
+        let progress = Arc::new(WriteProgressState::new(Arc::new(move |p| {
+            updates_clone.lock().unwrap().push(p);
+        })));
 
-        let batch = record_batch!(("id", Int32, [10, 20])).unwrap();
-        table
-            .add(batch)
-            .progress(move |p| {
-                updates_clone.lock().unwrap().push(p);
-            })
-            .execute()
-            .await
-            .unwrap();
+        let body = super::RemoteInsertExec::<crate::remote::client::Sender>::stream_as_body(
+            record_batch_stream,
+            Some(progress),
+        )
+        .unwrap();
 
-        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        // Consume the body to drive the stream.
+        use http_body_util::BodyExt;
+        let mut body: reqwest::Body = body;
+        while let Some(result) = body.frame().await {
+            result.unwrap();
+        }
 
-        // Note: the mock HTTP sender doesn't consume the streaming body,
-        // so progress callbacks may not fire. We verify the insert succeeded
-        // and the progress callback was wired without panics.
+        let updates = updates.lock().unwrap();
+        assert!(
+            updates.len() >= 2,
+            "expected at least 2 progress updates for 2 batches, got {}",
+            updates.len(),
+        );
+        let last = updates.last().unwrap();
+        assert_eq!(last.rows_written, 4);
+        assert!(last.bytes_written > 0);
+        assert!(last.elapsed.as_nanos() > 0);
     }
 }

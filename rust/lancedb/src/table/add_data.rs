@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The LanceDB Authors
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -14,21 +13,30 @@ use crate::Result;
 use super::{BaseTable, WriteOptions};
 
 /// Progress information reported during a write operation.
+///
+/// The meaning of `bytes_written` depends on the backend:
+/// - **Local tables**: approximate in-memory Arrow array size (not on-disk size).
+/// - **Remote tables**: serialized IPC byte count sent over the wire.
+///
+/// In both cases the value is a rough progress indicator, not an exact measure
+/// of bytes persisted to storage.
 #[derive(Debug, Clone)]
 pub struct WriteProgress {
     /// Cumulative number of rows written so far.
     pub rows_written: usize,
-    /// Cumulative number of bytes written so far.
+    /// Cumulative bytes processed so far. See struct-level docs for semantics.
     pub bytes_written: usize,
     /// Elapsed time since the write operation started.
     pub elapsed: std::time::Duration,
 }
 
 /// Tracks cumulative write progress and fires a callback after each batch.
+///
+/// Both counters are updated under a single lock so the callback always
+/// observes a consistent (rows, bytes) pair, even with concurrent partitions.
 pub struct WriteProgressState {
     callback: Arc<dyn Fn(WriteProgress) + Send + Sync>,
-    rows_written: AtomicUsize,
-    bytes_written: AtomicUsize,
+    counters: Mutex<(usize, usize)>,
     start_time: Instant,
 }
 
@@ -36,16 +44,19 @@ impl WriteProgressState {
     pub fn new(callback: Arc<dyn Fn(WriteProgress) + Send + Sync>) -> Self {
         Self {
             callback,
-            rows_written: AtomicUsize::new(0),
-            bytes_written: AtomicUsize::new(0),
+            counters: Mutex::new((0, 0)),
             start_time: Instant::now(),
         }
     }
 
-    /// Atomically increment counters and fire the callback with cumulative totals.
+    /// Increment counters and fire the callback with consistent cumulative totals.
     pub fn report(&self, rows: usize, bytes: usize) {
-        let rows_written = self.rows_written.fetch_add(rows, Ordering::Relaxed) + rows;
-        let bytes_written = self.bytes_written.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let (rows_written, bytes_written) = {
+            let mut counters = self.counters.lock().unwrap();
+            counters.0 += rows;
+            counters.1 += bytes;
+            *counters
+        };
         (self.callback)(WriteProgress {
             rows_written,
             bytes_written,
@@ -56,9 +67,10 @@ impl WriteProgressState {
 
 impl std::fmt::Debug for WriteProgressState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let counters = self.counters.lock().unwrap();
         f.debug_struct("WriteProgressState")
-            .field("rows_written", &self.rows_written)
-            .field("bytes_written", &self.bytes_written)
+            .field("rows_written", &counters.0)
+            .field("bytes_written", &counters.1)
             .finish()
     }
 }

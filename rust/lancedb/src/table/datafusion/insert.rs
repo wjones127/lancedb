@@ -236,6 +236,8 @@ impl ExecutionPlan for InsertExec {
                 let progress = progress.clone();
                 let mapped = input_stream.map(move |result| {
                     if let Ok(ref batch) = result {
+                        // Reports in-memory Arrow array size, not on-disk bytes.
+                        // TODO: plumb actual bytes written to storage from Lance.
                         progress.report(batch.num_rows(), batch.get_array_memory_size());
                     }
                     result
