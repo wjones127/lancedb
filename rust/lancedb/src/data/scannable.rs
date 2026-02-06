@@ -201,6 +201,7 @@ pub struct WithEmbeddingsScannable {
     inner: Box<dyn Scannable>,
     embeddings: Vec<(EmbeddingDefinition, Arc<dyn EmbeddingFunction>)>,
     table_definition: TableDefinition,
+    rich_schema: SchemaRef,
 }
 
 impl WithEmbeddingsScannable {
@@ -225,18 +226,20 @@ impl WithEmbeddingsScannable {
             .collect();
 
         let table_definition = TableDefinition::new(output_schema, column_definitions);
+        let rich_schema = table_definition.clone().into_rich_schema();
 
         Ok(Self {
             inner,
             embeddings,
             table_definition,
+            rich_schema,
         })
     }
 }
 
 impl Scannable for WithEmbeddingsScannable {
     fn schema(&self) -> SchemaRef {
-        self.table_definition.clone().into_rich_schema()
+        self.rich_schema.clone()
     }
 
     fn scan_as_stream(&mut self) -> SendableRecordBatchStream {

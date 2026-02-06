@@ -4,6 +4,7 @@
 //! DataFusion ExecutionPlan for inserting data into LanceDB tables.
 
 use std::any::Any;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use arrow_array::{RecordBatch, UInt64Array};
@@ -80,6 +81,7 @@ pub struct InsertExec {
     write_params: WriteParams,
     properties: PlanProperties,
     partial_transactions: Arc<Mutex<Vec<Transaction>>>,
+    any_partition_failed: Arc<AtomicBool>,
 }
 
 impl InsertExec {
@@ -105,6 +107,7 @@ impl InsertExec {
             write_params,
             properties,
             partial_transactions: Arc::new(Mutex::new(Vec::with_capacity(num_partitions))),
+            any_partition_failed: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -156,12 +159,15 @@ impl ExecutionPlan for InsertExec {
                 "InsertExec requires exactly one child".to_string(),
             ));
         }
-        Ok(Arc::new(Self::new(
+        let mut new = Self::new(
             self.ds_wrapper.clone(),
             self.dataset.clone(),
             children[0].clone(),
             self.write_params.clone(),
-        )))
+        );
+        new.any_partition_failed = self.any_partition_failed.clone();
+        new.partial_transactions = self.partial_transactions.clone();
+        Ok(Arc::new(new))
     }
 
     fn execute(
@@ -175,12 +181,21 @@ impl ExecutionPlan for InsertExec {
         let partial_transactions = self.partial_transactions.clone();
         let total_partitions = self.input.output_partitioning().partition_count();
         let ds_wrapper = self.ds_wrapper.clone();
+        let any_partition_failed = self.any_partition_failed.clone();
 
         let stream = futures::stream::once(async move {
-            let transaction = InsertBuilder::new(dataset.clone())
+            let result = InsertBuilder::new(dataset.clone())
                 .with_params(&write_params)
                 .execute_uncommitted_stream(input_stream)
-                .await?;
+                .await;
+
+            let transaction = match result {
+                Ok(txn) => txn,
+                Err(e) => {
+                    any_partition_failed.store(true, Ordering::SeqCst);
+                    return Err(DataFusionError::External(Box::new(e)));
+                }
+            };
 
             let num_rows = count_rows_from_operation(&transaction.operation);
 
@@ -196,6 +211,11 @@ impl ExecutionPlan for InsertExec {
             };
 
             if let Some(transactions) = to_commit {
+                if any_partition_failed.load(Ordering::SeqCst) {
+                    return Err(DataFusionError::Execution(
+                        "Not committing because another partition failed".to_string(),
+                    ));
+                }
                 if let Some(merged_txn) = merge_transactions(transactions) {
                     let new_dataset = CommitBuilder::new(dataset.clone())
                         .execute(merged_txn)

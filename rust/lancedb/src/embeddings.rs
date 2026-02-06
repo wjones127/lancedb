@@ -287,6 +287,14 @@ pub fn compute_embeddings_for_batch(
 
     let mut result = batch;
     for ((fld, _), embedding) in embeddings.iter().zip(embedding_arrays.iter()) {
+        let schema = result.schema();
+        let src_field =
+            schema
+                .field_with_name(&fld.source_column)
+                .map_err(|_| Error::InvalidInput {
+                    message: format!("Source column '{}' not found in schema", fld.source_column),
+                })?;
+
         let dst_field_name = fld
             .dest_column
             .clone()
@@ -295,7 +303,7 @@ pub fn compute_embeddings_for_batch(
         let dst_field = Field::new(
             dst_field_name,
             embedding.data_type().clone(),
-            embedding.nulls().is_some(),
+            src_field.is_nullable(),
         );
 
         result = result.try_with_column(dst_field, embedding.clone())?;
@@ -309,7 +317,15 @@ impl<R: RecordBatchReader> WithEmbeddings<R> {
         self.embeddings
             .iter()
             .map(|(ed, func)| {
-                let src_field = schema.field_with_name(&ed.source_column).unwrap();
+                let src_field =
+                    schema
+                        .field_with_name(&ed.source_column)
+                        .map_err(|_| Error::InvalidInput {
+                            message: format!(
+                                "Source column '{}' not found in schema",
+                                ed.source_column
+                            ),
+                        })?;
 
                 let field_name = ed
                     .dest_column

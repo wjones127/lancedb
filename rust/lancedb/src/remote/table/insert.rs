@@ -85,8 +85,8 @@ impl<S: HttpSend + 'static> RemoteInsertExec<S> {
             options,
         )?;
 
-        let stream = futures::stream::try_unfold((data, writer), move |(mut data, mut writer)| {
-            async move {
+        let stream =
+            futures::stream::try_unfold((data, writer), move |(mut data, mut writer)| async move {
                 match data.next().await {
                     Some(Ok(batch)) => {
                         writer.write(&batch)?;
@@ -95,16 +95,17 @@ impl<S: HttpSend + 'static> RemoteInsertExec<S> {
                     }
                     Some(Err(e)) => Err(e),
                     None => {
-                        if let Err(ArrowError::IpcError(_msg)) = writer.finish() {
-                            // Will error if already closed.
-                            return Ok(None);
-                        };
+                        match writer.finish() {
+                            Ok(()) => {}
+                            Err(ArrowError::IpcError(_)) => return Ok(None),
+                            Err(e) => return Err(DataFusionError::ArrowError(Box::new(e), None)),
+                        }
                         let buffer = std::mem::take(writer.get_mut());
                         Ok(Some((buffer, (data, writer))))
                     }
                 }
-            }
-        });
+            })
+            .fuse();
 
         Ok(reqwest::Body::wrap_stream(stream))
     }

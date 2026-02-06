@@ -118,6 +118,13 @@ pub struct TableDefinition {
 
 impl TableDefinition {
     pub fn new(schema: SchemaRef, column_definitions: Vec<ColumnDefinition>) -> Self {
+        assert_eq!(
+            column_definitions.len(),
+            schema.fields().len(),
+            "column_definitions length ({}) must match schema fields length ({})",
+            column_definitions.len(),
+            schema.fields().len(),
+        );
         Self {
             column_definitions,
             schema,

@@ -21,7 +21,7 @@ use crate::utils::{supported_btree_data_type, supported_vector_data_type};
 use crate::{DistanceType, Error, Table};
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_ipc::reader::FileReader;
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::{ArrowError, DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion_common::DataFusionError;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -273,17 +273,37 @@ impl<S: HttpSend> RemoteTable<S> {
 
         //  Mutex is just here to make it sync. We shouldn't have any contention.
         let mut data = Mutex::new(data);
-        let body_iter = std::iter::from_fn(move || match data.get_mut().unwrap().next() {
-            Some(Ok(batch)) => {
-                writer.write(&batch).ok()?;
-                let buffer = std::mem::take(writer.get_mut());
-                Some(Ok(buffer))
+        let mut finished = false;
+        let body_iter = std::iter::from_fn(move || {
+            if finished {
+                return None;
             }
-            Some(Err(e)) => Some(Err(e)),
-            None => {
-                writer.finish().ok()?;
-                let buffer = std::mem::take(writer.get_mut());
-                Some(Ok(buffer))
+            match data.get_mut().unwrap().next() {
+                Some(Ok(batch)) => match writer.write(&batch) {
+                    Ok(()) => {
+                        let buffer = std::mem::take(writer.get_mut());
+                        Some(Ok(buffer))
+                    }
+                    Err(e) => {
+                        finished = true;
+                        Some(Err(e))
+                    }
+                },
+                Some(Err(e)) => {
+                    finished = true;
+                    Some(Err(e))
+                }
+                None => {
+                    finished = true;
+                    match writer.finish() {
+                        Ok(()) => {
+                            let buffer = std::mem::take(writer.get_mut());
+                            Some(Ok(buffer))
+                        }
+                        Err(ArrowError::IpcError(_)) => None,
+                        Err(e) => Some(Err(e)),
+                    }
+                }
             }
         });
         let body_stream = futures::stream::iter(body_iter);
@@ -606,17 +626,21 @@ impl<S: HttpSend> RemoteTable<S> {
                         .as_any()
                         .downcast_ref::<arrow_array::Float32Array>()
                         .unwrap();
-                    Ok(serde_json::Value::Array(
-                        array
-                            .values()
-                            .iter()
-                            .map(|v| {
-                                serde_json::Value::Number(
-                                    serde_json::Number::from_f64(*v as f64).unwrap(),
-                                )
-                            })
-                            .collect(),
-                    ))
+                    let values = array
+                        .values()
+                        .iter()
+                        .map(|v| {
+                            serde_json::Number::from_f64(*v as f64)
+                                .map(serde_json::Value::Number)
+                                .ok_or_else(|| Error::InvalidInput {
+                                    message: format!(
+                                        "VectorQuery contains non-finite float value: {}",
+                                        v
+                                    ),
+                                })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(serde_json::Value::Array(values))
                 }
                 _ => Err(Error::InvalidInput {
                     message: "VectorQuery vector must be of type Float32".into(),
@@ -1417,16 +1441,22 @@ impl<S: HttpSend> BaseTable for RemoteTable<S> {
                     value["rename"] = serde_json::Value::String(rename.clone());
                 }
                 if let Some(data_type) = &alteration.data_type {
-                    let json_data_type = JsonDataType::try_from(data_type).unwrap();
-                    let json_data_type = serde_json::to_value(&json_data_type).unwrap();
+                    let json_data_type =
+                        JsonDataType::try_from(data_type).map_err(|e| Error::InvalidInput {
+                            message: format!("Unsupported data type for alter_columns: {}", e),
+                        })?;
+                    let json_data_type =
+                        serde_json::to_value(&json_data_type).map_err(|e| Error::Runtime {
+                            message: format!("Failed to serialize data type: {}", e),
+                        })?;
                     value["data_type"] = json_data_type;
                 }
                 if let Some(nullable) = &alteration.nullable {
                     value["nullable"] = serde_json::Value::Bool(*nullable);
                 }
-                value
+                Ok(value)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let body = serde_json::json!({ "alterations": body });
         let request = self
             .client
