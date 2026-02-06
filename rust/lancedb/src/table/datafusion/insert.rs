@@ -17,11 +17,13 @@ use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
+use futures::StreamExt;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{CommitBuilder, InsertBuilder, WriteParams};
 use lance::Dataset;
 use lance_table::format::Fragment;
 
+use crate::table::add_data::WriteProgressState;
 use crate::table::dataset::DatasetConsistencyWrapper;
 
 pub(crate) static COUNT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -115,6 +117,7 @@ pub struct InsertExec {
     /// which partition calls `execute` first. Reset back to `false` after all
     /// partitions complete so subsequent executions start fresh.
     did_reset: Arc<AtomicBool>,
+    progress: Option<Arc<WriteProgressState>>,
 }
 
 impl InsertExec {
@@ -123,6 +126,7 @@ impl InsertExec {
         dataset: Arc<Dataset>,
         input: Arc<dyn ExecutionPlan>,
         write_params: WriteParams,
+        progress: Option<Arc<WriteProgressState>>,
     ) -> Self {
         let schema = COUNT_SCHEMA.clone();
         let num_partitions = input.output_partitioning().partition_count();
@@ -141,6 +145,7 @@ impl InsertExec {
             properties,
             exec_state: Arc::new(Mutex::new(InsertExecState::new(num_partitions))),
             did_reset: Arc::new(AtomicBool::new(false)),
+            progress,
         }
     }
 }
@@ -197,6 +202,7 @@ impl ExecutionPlan for InsertExec {
             self.dataset.clone(),
             children[0].clone(),
             self.write_params.clone(),
+            self.progress.clone(),
         );
         new.exec_state = self.exec_state.clone();
         new.did_reset = self.did_reset.clone();
@@ -222,8 +228,23 @@ impl ExecutionPlan for InsertExec {
         let exec_state = self.exec_state.clone();
         let ds_wrapper = self.ds_wrapper.clone();
         let did_reset = self.did_reset.clone();
+        let progress = self.progress.clone();
 
         let stream = futures::stream::once(async move {
+            let input_stream = if let Some(ref progress) = progress {
+                let schema = input_stream.schema();
+                let progress = progress.clone();
+                let mapped = input_stream.map(move |result| {
+                    if let Ok(ref batch) = result {
+                        progress.report(batch.num_rows(), batch.get_array_memory_size());
+                    }
+                    result
+                });
+                Box::pin(RecordBatchStreamAdapter::new(schema, mapped)) as SendableRecordBatchStream
+            } else {
+                input_stream
+            };
+
             let result = InsertBuilder::new(dataset.clone())
                 .with_params(&write_params)
                 .execute_uncommitted_stream(input_stream)
@@ -616,6 +637,7 @@ mod tests {
             dataset,
             error_plan,
             WriteParams::default(),
+            None,
         );
         let insert_plan: Arc<dyn ExecutionPlan> = Arc::new(insert_exec);
 
@@ -679,6 +701,7 @@ mod tests {
             dataset,
             error_input,
             WriteParams::default(),
+            None,
         );
         let insert_plan: Arc<dyn ExecutionPlan> = Arc::new(insert_exec);
 
@@ -760,5 +783,81 @@ mod tests {
 
         table.checkout_latest().await.unwrap();
         assert_eq!(table.count_rows(None).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_insert_with_progress() {
+        use crate::table::add_data::{WriteProgress, WriteProgressState};
+        use datafusion_catalog::TableProvider;
+
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let db = connect(uri).execute().await.unwrap();
+
+        let batch = record_batch!(("id", Int32, [1])).unwrap();
+        let schema = batch.schema();
+
+        let table = db
+            .create_table("test_progress", batch)
+            .execute()
+            .await
+            .unwrap();
+
+        let ctx = SessionContext::new();
+
+        // Multi-batch, multi-partition source
+        let source = MemTable::try_new(
+            schema.clone(),
+            vec![
+                vec![
+                    record_batch!(("id", Int32, [2, 3])).unwrap(),
+                    record_batch!(("id", Int32, [4, 5])).unwrap(),
+                ],
+                vec![record_batch!(("id", Int32, [6, 7, 8])).unwrap()],
+            ],
+        )
+        .unwrap();
+        let source_plan = source.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let updates: Arc<Mutex<Vec<WriteProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let updates_clone = updates.clone();
+        let progress = Arc::new(WriteProgressState::new(Arc::new(move |p| {
+            updates_clone.lock().unwrap().push(p);
+        })));
+
+        let ds_wrapper = table.dataset().unwrap().clone();
+        let ds = ds_wrapper.get().await.unwrap();
+        let dataset = Arc::new((*ds).clone());
+        drop(ds);
+
+        let write_params = WriteParams {
+            mode: lance::dataset::WriteMode::Append,
+            ..Default::default()
+        };
+
+        let insert_exec = InsertExec::new(
+            ds_wrapper.clone(),
+            dataset,
+            source_plan,
+            write_params,
+            Some(progress),
+        );
+        let insert_plan: Arc<dyn ExecutionPlan> = Arc::new(insert_exec);
+
+        let task_ctx = ctx.task_ctx();
+        datafusion_physical_plan::collect(insert_plan, task_ctx)
+            .await
+            .unwrap();
+
+        table.checkout_latest().await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 8);
+
+        let updates = updates.lock().unwrap();
+        assert!(!updates.is_empty(), "should have received progress updates");
+        let last = updates.last().unwrap();
+        assert!(last.rows_written > 0);
+        assert!(last.bytes_written > 0);
+        assert!(last.elapsed.as_nanos() > 0);
     }
 }

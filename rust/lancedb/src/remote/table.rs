@@ -962,12 +962,16 @@ impl<S: HttpSend> BaseTable for RemoteTable<S> {
         .await?;
 
         // Create RemoteInsertExec (keep typed reference for result extraction)
+        let progress = add
+            .progress_callback
+            .map(|cb| Arc::new(crate::table::add_data::WriteProgressState::new(cb)));
         let insert = Arc::new(insert::RemoteInsertExec::new(
             self.name.clone(),
             self.identifier.clone(),
             self.client.clone(),
             plan,
             overwrite,
+            progress,
         ));
         let insert_ref = insert.clone();
         let insert_plan: Arc<dyn ExecutionPlan> = insert;
@@ -1684,6 +1688,7 @@ impl<S: HttpSend> BaseTable for RemoteTable<S> {
             self.client.clone(),
             input,
             overwrite,
+            None,
         )))
     }
 }

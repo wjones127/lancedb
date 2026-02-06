@@ -76,12 +76,12 @@ use crate::utils::{
 use self::dataset::DatasetConsistencyWrapper;
 use self::merge::MergeInsertBuilder;
 
-mod add_data;
+pub mod add_data;
 pub mod datafusion;
 pub(crate) mod dataset;
 pub mod merge;
 
-pub use add_data::{AddDataBuilder, AddDataMode, AddResult};
+pub use add_data::{AddDataBuilder, AddDataMode, AddResult, WriteProgress, WriteProgressState};
 
 use crate::index::waiter::wait_for_index;
 pub use chrono::Duration;
@@ -2750,6 +2750,9 @@ impl BaseTable for NativeTable {
         .await?;
 
         // Add insert exec
+        let progress = add
+            .progress_callback
+            .map(|cb| Arc::new(add_data::WriteProgressState::new(cb)));
         let ds = self.dataset.get().await?;
         let dataset = Arc::new((*ds).clone());
         drop(ds);
@@ -2758,6 +2761,7 @@ impl BaseTable for NativeTable {
             dataset,
             plan,
             lance_params,
+            progress,
         ));
 
         // Execute
@@ -3372,6 +3376,7 @@ impl BaseTable for NativeTable {
             dataset,
             input,
             write_params,
+            None,
         )))
     }
 }
