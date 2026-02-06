@@ -4,6 +4,7 @@
 //! DataFusion ExecutionPlan for inserting data into LanceDB tables.
 
 use std::any::Any;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use arrow_array::{RecordBatch, UInt64Array};
@@ -16,11 +17,13 @@ use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
+use futures::StreamExt;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{CommitBuilder, InsertBuilder, WriteParams};
 use lance::Dataset;
 use lance_table::format::Fragment;
 
+use crate::table::add_data::WriteProgressState;
 use crate::table::dataset::DatasetConsistencyWrapper;
 
 pub(crate) static COUNT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -66,6 +69,36 @@ fn merge_transactions(mut transactions: Vec<Transaction>) -> Option<Transaction>
     Some(first)
 }
 
+/// Mutable state shared across partitions within a single execution.
+///
+/// Bundled into a single `Mutex` so that `did_reset` can be cleared once all
+/// partitions (both successful and failed) have reported, allowing subsequent
+/// executions of the same plan to start with fresh state.
+#[derive(Debug)]
+struct InsertExecState {
+    partial_transactions: Vec<Transaction>,
+    any_partition_failed: bool,
+    /// Number of partitions that have finished (success or failure).
+    completed_count: usize,
+}
+
+impl InsertExecState {
+    fn new(num_partitions: usize) -> Self {
+        Self {
+            partial_transactions: Vec::with_capacity(num_partitions),
+            any_partition_failed: false,
+            completed_count: 0,
+        }
+    }
+
+    fn reset(&mut self, num_partitions: usize) {
+        self.partial_transactions.clear();
+        self.partial_transactions.reserve(num_partitions);
+        self.any_partition_failed = false;
+        self.completed_count = 0;
+    }
+}
+
 /// ExecutionPlan for inserting data into a native LanceDB table.
 ///
 /// This plan executes inserts by:
@@ -79,7 +112,12 @@ pub struct InsertExec {
     input: Arc<dyn ExecutionPlan>,
     write_params: WriteParams,
     properties: PlanProperties,
-    partial_transactions: Arc<Mutex<Vec<Transaction>>>,
+    exec_state: Arc<Mutex<InsertExecState>>,
+    /// Ensures shared state is reset exactly once per execution, regardless of
+    /// which partition calls `execute` first. Reset back to `false` after all
+    /// partitions complete so subsequent executions start fresh.
+    did_reset: Arc<AtomicBool>,
+    progress: Option<Arc<WriteProgressState>>,
 }
 
 impl InsertExec {
@@ -88,6 +126,7 @@ impl InsertExec {
         dataset: Arc<Dataset>,
         input: Arc<dyn ExecutionPlan>,
         write_params: WriteParams,
+        progress: Option<Arc<WriteProgressState>>,
     ) -> Self {
         let schema = COUNT_SCHEMA.clone();
         let num_partitions = input.output_partitioning().partition_count();
@@ -104,7 +143,9 @@ impl InsertExec {
             input,
             write_params,
             properties,
-            partial_transactions: Arc::new(Mutex::new(Vec::with_capacity(num_partitions))),
+            exec_state: Arc::new(Mutex::new(InsertExecState::new(num_partitions))),
+            did_reset: Arc::new(AtomicBool::new(false)),
+            progress,
         }
     }
 }
@@ -156,12 +197,16 @@ impl ExecutionPlan for InsertExec {
                 "InsertExec requires exactly one child".to_string(),
             ));
         }
-        Ok(Arc::new(Self::new(
+        let mut new = Self::new(
             self.ds_wrapper.clone(),
             self.dataset.clone(),
             children[0].clone(),
             self.write_params.clone(),
-        )))
+            self.progress.clone(),
+        );
+        new.exec_state = self.exec_state.clone();
+        new.did_reset = self.did_reset.clone();
+        Ok(Arc::new(new))
     }
 
     fn execute(
@@ -169,33 +214,80 @@ impl ExecutionPlan for InsertExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        let total_partitions = self.input.output_partitioning().partition_count();
+        if self
+            .did_reset
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.exec_state.lock().unwrap().reset(total_partitions);
+        }
         let input_stream = self.input.execute(partition, context)?;
         let dataset = self.dataset.clone();
         let write_params = self.write_params.clone();
-        let partial_transactions = self.partial_transactions.clone();
-        let total_partitions = self.input.output_partitioning().partition_count();
+        let exec_state = self.exec_state.clone();
         let ds_wrapper = self.ds_wrapper.clone();
+        let did_reset = self.did_reset.clone();
+        let progress = self.progress.clone();
 
         let stream = futures::stream::once(async move {
-            let transaction = InsertBuilder::new(dataset.clone())
+            let input_stream = if let Some(ref progress) = progress {
+                let schema = input_stream.schema();
+                let progress = progress.clone();
+                let mapped = input_stream.map(move |result| {
+                    if let Ok(ref batch) = result {
+                        // Reports in-memory Arrow array size, not on-disk bytes.
+                        // TODO: plumb actual bytes written to storage from Lance.
+                        progress.report(batch.num_rows(), batch.get_array_memory_size());
+                    }
+                    result
+                });
+                Box::pin(RecordBatchStreamAdapter::new(schema, mapped)) as SendableRecordBatchStream
+            } else {
+                input_stream
+            };
+
+            let result = InsertBuilder::new(dataset.clone())
                 .with_params(&write_params)
                 .execute_uncommitted_stream(input_stream)
-                .await?;
+                .await;
+
+            let transaction = match result {
+                Ok(txn) => txn,
+                Err(e) => {
+                    let mut state = exec_state.lock().unwrap();
+                    state.any_partition_failed = true;
+                    state.completed_count += 1;
+                    if state.completed_count == total_partitions {
+                        did_reset.store(false, Ordering::SeqCst);
+                    }
+                    return Err(DataFusionError::External(Box::new(e)));
+                }
+            };
 
             let num_rows = count_rows_from_operation(&transaction.operation);
 
             let to_commit = {
-                // Don't hold the lock over an await point.
-                let mut txns = partial_transactions.lock().unwrap();
-                txns.push(transaction);
-                if txns.len() == total_partitions {
-                    Some(std::mem::take(&mut *txns))
+                let mut state = exec_state.lock().unwrap();
+                state.partial_transactions.push(transaction);
+                state.completed_count += 1;
+                if state.completed_count == total_partitions {
+                    did_reset.store(false, Ordering::SeqCst);
+                    Some((
+                        std::mem::take(&mut state.partial_transactions),
+                        state.any_partition_failed,
+                    ))
                 } else {
                     None
                 }
             };
 
-            if let Some(transactions) = to_commit {
+            if let Some((transactions, any_failed)) = to_commit {
+                if any_failed {
+                    return Err(DataFusionError::Execution(
+                        "Not committing because another partition failed".to_string(),
+                    ));
+                }
                 if let Some(merged_txn) = merge_transactions(transactions) {
                     let new_dataset = CommitBuilder::new(dataset.clone())
                         .execute(merged_txn)
@@ -228,6 +320,86 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::connect;
+
+    /// An ExecutionPlan that wraps another plan but injects an error into one partition's stream.
+    #[derive(Debug)]
+    struct ErrorInjectingExec {
+        input: Arc<dyn ExecutionPlan>,
+        /// Which partition should produce an error.
+        error_partition: usize,
+        properties: PlanProperties,
+    }
+
+    impl ErrorInjectingExec {
+        fn new(input: Arc<dyn ExecutionPlan>, error_partition: usize) -> Self {
+            let properties = input.properties().clone();
+            Self {
+                input,
+                error_partition,
+                properties,
+            }
+        }
+    }
+
+    impl DisplayAs for ErrorInjectingExec {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            write!(f, "ErrorInjectingExec")
+        }
+    }
+
+    impl ExecutionPlan for ErrorInjectingExec {
+        fn name(&self) -> &str {
+            "ErrorInjectingExec"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.input.schema()
+        }
+
+        fn properties(&self) -> &PlanProperties {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.input]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self::new(
+                children[0].clone(),
+                self.error_partition,
+            )))
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            if partition == self.error_partition {
+                let schema = self.schema();
+                let stream = futures::stream::once(async {
+                    Err(DataFusionError::Execution(
+                        "injected partition error".to_string(),
+                    ))
+                });
+                Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+            } else {
+                self.input.execute(partition, context)
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_insert_via_sql() {
@@ -418,5 +590,276 @@ mod tests {
         // Verify: should have 1 + 2 + 2 + 3 = 8 rows
         table.checkout_latest().await.unwrap();
         assert_eq!(table.count_rows(None).await.unwrap(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_insert_no_commit_on_partition_failure() {
+        use datafusion_catalog::TableProvider;
+
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let db = connect(uri).execute().await.unwrap();
+
+        let batch = record_batch!(("id", Int32, [1])).unwrap();
+        let schema = batch.schema();
+
+        let table = db
+            .create_table("test_partition_fail", batch)
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(table.count_rows(None).await.unwrap(), 1);
+
+        let ctx = SessionContext::new();
+
+        // Create a source with 2 partitions, where partition 1 will error.
+        let good_data = MemTable::try_new(
+            schema.clone(),
+            vec![
+                vec![record_batch!(("id", Int32, [2, 3])).unwrap()],
+                vec![record_batch!(("id", Int32, [4, 5])).unwrap()],
+            ],
+        )
+        .unwrap();
+        let good_plan = good_data.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        // Wrap in ErrorInjectingExec to make partition 1 fail.
+        let error_plan: Arc<dyn ExecutionPlan> = Arc::new(ErrorInjectingExec::new(good_plan, 1));
+
+        // Build InsertExec directly.
+        let ds_wrapper = table.dataset().unwrap().clone();
+        let ds = ds_wrapper.get().await.unwrap();
+        let dataset = Arc::new((*ds).clone());
+        drop(ds);
+
+        let insert_exec = InsertExec::new(
+            ds_wrapper.clone(),
+            dataset,
+            error_plan,
+            WriteParams::default(),
+            None,
+        );
+        let insert_plan: Arc<dyn ExecutionPlan> = Arc::new(insert_exec);
+
+        let task_ctx = ctx.task_ctx();
+        let results = datafusion_physical_plan::collect(insert_plan, task_ctx).await;
+
+        // The insert should fail because one partition errored.
+        assert!(
+            results.is_err(),
+            "Expected insert to fail due to partition error"
+        );
+
+        // The table should still have only 1 row (no commit occurred).
+        table.checkout_latest().await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 1);
+    }
+
+    /// Verifies that `did_reset` is properly cleared after a failed execution
+    /// with partition errors, allowing subsequent executions to start fresh.
+    #[tokio::test]
+    async fn test_insert_state_resets_after_failure() {
+        use datafusion_catalog::TableProvider;
+
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let db = connect(uri).execute().await.unwrap();
+
+        let batch = record_batch!(("id", Int32, [1])).unwrap();
+        let schema = batch.schema();
+
+        let table = db
+            .create_table("test_state_reset", batch)
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(table.count_rows(None).await.unwrap(), 1);
+
+        let ctx = SessionContext::new();
+
+        // Execute with 2 partitions where partition 1 fails.
+        let source = MemTable::try_new(
+            schema.clone(),
+            vec![
+                vec![record_batch!(("id", Int32, [2, 3])).unwrap()],
+                vec![record_batch!(("id", Int32, [4, 5])).unwrap()],
+            ],
+        )
+        .unwrap();
+        let source_plan = source.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let error_input: Arc<dyn ExecutionPlan> = Arc::new(ErrorInjectingExec::new(source_plan, 1));
+
+        let ds_wrapper = table.dataset().unwrap().clone();
+        let ds = ds_wrapper.get().await.unwrap();
+        let dataset = Arc::new((*ds).clone());
+        drop(ds);
+
+        let insert_exec = InsertExec::new(
+            ds_wrapper.clone(),
+            dataset,
+            error_input,
+            WriteParams::default(),
+            None,
+        );
+        let insert_plan: Arc<dyn ExecutionPlan> = Arc::new(insert_exec);
+
+        let task_ctx = ctx.task_ctx();
+        let result = datafusion_physical_plan::collect(insert_plan.clone(), task_ctx).await;
+        assert!(result.is_err(), "Expected execution to fail");
+
+        // No data should have been committed.
+        table.checkout_latest().await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 1);
+
+        // Verify that `did_reset` was cleared, allowing the next execution
+        // to properly reset state. Without this fix, `did_reset` would remain
+        // `true` and stale `any_partition_failed` state would leak.
+        let insert_ref = insert_plan.as_any().downcast_ref::<InsertExec>().unwrap();
+        assert!(
+            !insert_ref.did_reset.load(Ordering::SeqCst),
+            "did_reset should be false after all partitions completed, \
+             allowing next execution to reset state"
+        );
+
+        // Verify that the failure was recorded.
+        let state = insert_ref.exec_state.lock().unwrap();
+        assert!(
+            state.any_partition_failed,
+            "any_partition_failed should be true after a partition error"
+        );
+        assert_eq!(
+            state.completed_count, 2,
+            "all partitions should have reported completion"
+        );
+    }
+
+    /// Verifies that two successive successful insert executions via SQL both
+    /// commit correctly, proving state doesn't leak between runs.
+    #[tokio::test]
+    async fn test_insert_two_successive_executions() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let db = connect(uri).execute().await.unwrap();
+
+        let batch = record_batch!(("id", Int32, [1])).unwrap();
+
+        let table = db
+            .create_table("test_successive", batch)
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(table.count_rows(None).await.unwrap(), 1);
+
+        let ctx = SessionContext::new();
+        let provider =
+            crate::table::datafusion::BaseTableAdapter::try_new(table.base_table().clone())
+                .await
+                .unwrap();
+        ctx.register_table("test_successive", Arc::new(provider))
+            .unwrap();
+
+        // First insert
+        ctx.sql("INSERT INTO test_successive VALUES (2), (3)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        table.checkout_latest().await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 3);
+
+        // Second insert on the same registered table
+        ctx.sql("INSERT INTO test_successive VALUES (4), (5)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        table.checkout_latest().await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_insert_with_progress() {
+        use crate::table::add_data::{WriteProgress, WriteProgressState};
+        use datafusion_catalog::TableProvider;
+
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let db = connect(uri).execute().await.unwrap();
+
+        let batch = record_batch!(("id", Int32, [1])).unwrap();
+        let schema = batch.schema();
+
+        let table = db
+            .create_table("test_progress", batch)
+            .execute()
+            .await
+            .unwrap();
+
+        let ctx = SessionContext::new();
+
+        // Multi-batch, multi-partition source
+        let source = MemTable::try_new(
+            schema.clone(),
+            vec![
+                vec![
+                    record_batch!(("id", Int32, [2, 3])).unwrap(),
+                    record_batch!(("id", Int32, [4, 5])).unwrap(),
+                ],
+                vec![record_batch!(("id", Int32, [6, 7, 8])).unwrap()],
+            ],
+        )
+        .unwrap();
+        let source_plan = source.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let updates: Arc<Mutex<Vec<WriteProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let updates_clone = updates.clone();
+        let progress = Arc::new(WriteProgressState::new(Arc::new(move |p| {
+            updates_clone.lock().unwrap().push(p);
+        })));
+
+        let ds_wrapper = table.dataset().unwrap().clone();
+        let ds = ds_wrapper.get().await.unwrap();
+        let dataset = Arc::new((*ds).clone());
+        drop(ds);
+
+        let write_params = WriteParams {
+            mode: lance::dataset::WriteMode::Append,
+            ..Default::default()
+        };
+
+        let insert_exec = InsertExec::new(
+            ds_wrapper.clone(),
+            dataset,
+            source_plan,
+            write_params,
+            Some(progress),
+        );
+        let insert_plan: Arc<dyn ExecutionPlan> = Arc::new(insert_exec);
+
+        let task_ctx = ctx.task_ctx();
+        datafusion_physical_plan::collect(insert_plan, task_ctx)
+            .await
+            .unwrap();
+
+        table.checkout_latest().await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 8);
+
+        let updates = updates.lock().unwrap();
+        assert!(!updates.is_empty(), "should have received progress updates");
+        let last = updates.last().unwrap();
+        assert!(last.rows_written > 0);
+        assert!(last.bytes_written > 0);
+        assert!(last.elapsed.as_nanos() > 0);
     }
 }

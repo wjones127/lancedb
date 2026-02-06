@@ -19,8 +19,8 @@ pub fn stream_as_ipc(
     let buf = Vec::with_capacity(WRITE_BUF_SIZE);
     let writer =
         arrow_ipc::writer::StreamWriter::try_new_with_options(buf, &data.schema(), options)?;
-    let stream = futures::stream::try_unfold((data, writer), move |(mut data, mut writer)| {
-        async move {
+    let stream =
+        futures::stream::try_unfold((data, writer), move |(mut data, mut writer)| async move {
             match data.next().await {
                 Some(Ok(batch)) => {
                     writer.write(&batch)?;
@@ -29,16 +29,16 @@ pub fn stream_as_ipc(
                 }
                 Some(Err(e)) => Err(e),
                 None => {
-                    if let Err(ArrowError::IpcError(_msg)) = writer.finish() {
-                        // Will error if already closed.
-                        return Ok(None);
-                    };
+                    match writer.finish() {
+                        Ok(()) => {}
+                        Err(ArrowError::IpcError(_)) => return Ok(None),
+                        Err(e) => return Err(e.into()),
+                    }
                     let buffer = std::mem::take(writer.get_mut());
                     Ok(Some((bytes::Bytes::from(buffer), (data, writer))))
                 }
             }
-        }
-    });
+        });
     Ok(stream.fuse())
 }
 

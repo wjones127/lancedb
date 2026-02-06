@@ -28,7 +28,7 @@ pub enum Error {
 
     #[snafu(display("Table '{name}' already exists"))]
     TableAlreadyExists { name: String },
-    #[snafu(display("Unable to created lance dataset at {path}: {source}"))]
+    #[snafu(display("Unable to create lance dataset at {path}: {source}"))]
     CreateDir {
         path: String,
         source: std::io::Error,

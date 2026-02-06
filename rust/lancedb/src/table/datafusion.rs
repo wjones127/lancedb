@@ -6,7 +6,9 @@
 pub mod cast_vector;
 pub mod embedding_udf;
 pub mod insert;
+pub mod pipeline;
 pub mod preprocessing;
+pub mod scannable_exec;
 pub mod udtf;
 
 use std::{collections::HashMap, sync::Arc};
@@ -107,7 +109,11 @@ impl ExecutionPlan for MetadataEraserExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        assert_eq!(children.len(), 1);
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(
+                "MetadataEraserExec requires exactly one child".to_string(),
+            ));
+        }
         let new_properties = Self::compute_properties_from_input(&children[0], &self.schema);
         Ok(Arc::new(Self {
             input: children[0].clone(),

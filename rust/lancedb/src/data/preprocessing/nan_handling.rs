@@ -429,7 +429,9 @@ fn fill_list_rows<O: OffsetSizeTrait>(arr: &dyn Array, fill: f64) -> Result<Arra
         DataType::Float16 => {
             let casted = cast(values, &DataType::Float32)?;
             let prim = casted.as_primitive::<Float32Type>().clone();
-            Arc::new(replace_nan_with(prim, fill_f32))
+            let filled = replace_nan_with(prim, fill_f32);
+            // Cast back to Float16 to preserve the original type
+            cast(&filled, &DataType::Float16)?
         }
         _ => return Ok(Arc::new(list.clone())),
     };
@@ -438,12 +440,6 @@ fn fill_list_rows<O: OffsetSizeTrait>(arr: &dyn Array, fill: f64) -> Result<Arra
         DataType::List(f) | DataType::LargeList(f) => f.clone(),
         _ => unreachable!(),
     };
-    // Update field data type if cast changed it (Float16 → Float32)
-    let inner_field = Arc::new(Field::new(
-        inner_field.name(),
-        new_values.data_type().clone(),
-        inner_field.is_nullable(),
-    ));
     let new_list = GenericListArray::<O>::new(
         inner_field,
         list.offsets().clone(),
@@ -483,7 +479,9 @@ fn fill_fsl_rows(fsl: &FixedSizeListArray, fill: f64) -> Result<ArrayRef> {
         DataType::Float16 => {
             let casted = cast(values, &DataType::Float32)?;
             let arr: PrimitiveArray<Float32Type> = casted.as_primitive::<Float32Type>().clone();
-            Arc::new(replace_nan_with(arr, fill_f32))
+            let filled = replace_nan_with(arr, fill_f32);
+            // Cast back to Float16 to preserve the original type
+            cast(&filled, &DataType::Float16)?
         }
         _ => return Ok(Arc::new(fsl.clone())),
     };
@@ -815,6 +813,47 @@ mod tests {
         assert!(!fsl.is_null(1));
     }
 
+    #[tokio::test]
+    async fn test_nan_fill_fsl_f16_preserves_type() {
+        use half::f16;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vec",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float16, true)), 2),
+            true,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![{
+                use arrow_array::builder::{FixedSizeListBuilder, Float16Builder};
+                let mut builder = FixedSizeListBuilder::new(Float16Builder::with_capacity(4), 2);
+                builder.values().append_value(f16::from_f32(1.0));
+                builder.values().append_value(f16::NAN);
+                builder.append(true);
+                builder.values().append_value(f16::from_f32(3.0));
+                builder.values().append_value(f16::from_f32(4.0));
+                builder.append(true);
+                Arc::new(builder.finish()) as ArrayRef
+            }],
+        )
+        .unwrap();
+
+        let stream = make_stream(schema.clone(), vec![batch]);
+        let mut stream = handle_nan_vectors(stream, &NanStrategy::Fill(0.0));
+        let result_batch = stream.try_next().await.unwrap().unwrap();
+        assert_eq!(result_batch.schema(), schema);
+        let fsl = result_batch.column(0).as_fixed_size_list();
+        let row0 = fsl.value(0);
+        let row0_f16 = row0.as_primitive::<Float16Type>();
+        assert_eq!(row0_f16.value(0).to_f32(), 1.0);
+        assert_eq!(row0_f16.value(1).to_f32(), 0.0); // was NaN, now filled
+        let row1 = fsl.value(1);
+        let row1_f16 = row1.as_primitive::<Float16Type>();
+        assert_eq!(row1_f16.value(0).to_f32(), 3.0);
+        assert_eq!(row1_f16.value(1).to_f32(), 4.0);
+    }
+
     // -----------------------------------------------------------------------
     // List / LargeList tests
     // -----------------------------------------------------------------------
@@ -1095,5 +1134,107 @@ mod tests {
             .column(0)
             .as_primitive::<arrow_array::types::Int32Type>();
         assert_eq!(ids.value(0), 3);
+    }
+
+    /// Build a `List<Float16>` array from optional rows.
+    fn make_list_f16(values: &[Option<Vec<f32>>]) -> ArrayRef {
+        use arrow_array::builder::{Float16Builder, ListBuilder};
+        let mut builder = ListBuilder::new(Float16Builder::new());
+        for row in values {
+            match row {
+                Some(vals) => {
+                    for v in vals {
+                        builder.values().append_value(half::f16::from_f32(*v));
+                    }
+                    builder.append(true);
+                }
+                None => {
+                    builder.append(false);
+                }
+            }
+        }
+        Arc::new(builder.finish())
+    }
+
+    #[tokio::test]
+    async fn test_nan_fill_list_f16_preserves_type() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vec",
+            DataType::List(Arc::new(Field::new("item", DataType::Float16, true))),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![make_list_f16(&[
+                Some(vec![1.0, 2.0]),
+                Some(vec![f32::NAN, 4.0]),
+            ])],
+        )
+        .unwrap();
+
+        let stream = make_stream(schema.clone(), vec![batch]);
+        let mut stream = handle_nan_vectors(stream, &NanStrategy::Fill(0.0));
+        let result_batch = stream.try_next().await.unwrap().unwrap();
+        // The result must conform to the original schema (Float16 inner type)
+        assert_eq!(result_batch.schema(), schema);
+        let list = result_batch.column(0).as_list::<i32>();
+        let row1 = list.value(1);
+        let row1_f16 = row1.as_primitive::<Float16Type>();
+        assert_eq!(row1_f16.value(0).to_f32(), 0.0); // was NaN, now filled
+        assert_eq!(row1_f16.value(1).to_f32(), 4.0);
+    }
+
+    #[tokio::test]
+    async fn test_nan_fill_large_list_f32() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vec",
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true))),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![make_large_list_f32(&[
+                Some(vec![1.0, 2.0]),
+                Some(vec![f32::NAN, 4.0]),
+            ])],
+        )
+        .unwrap();
+
+        let stream = make_stream(schema.clone(), vec![batch]);
+        let mut stream = handle_nan_vectors(stream, &NanStrategy::Fill(0.0));
+        let result_batch = stream.try_next().await.unwrap().unwrap();
+        assert_eq!(result_batch.num_rows(), 2);
+        let list = result_batch.column(0).as_list::<i64>();
+        let row1 = list.value(1);
+        let row1_f32 = row1.as_primitive::<Float32Type>();
+        assert_eq!(row1_f32.value(0), 0.0);
+        assert_eq!(row1_f32.value(1), 4.0);
+    }
+
+    #[tokio::test]
+    async fn test_nan_null_large_list_f32() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vec",
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true))),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![make_large_list_f32(&[
+                Some(vec![1.0, 2.0]),
+                Some(vec![f32::NAN, 4.0]),
+                Some(vec![5.0, 6.0]),
+            ])],
+        )
+        .unwrap();
+
+        let stream = make_stream(schema.clone(), vec![batch]);
+        let mut stream = handle_nan_vectors(stream, &NanStrategy::Null);
+        let result_batch = stream.try_next().await.unwrap().unwrap();
+        assert_eq!(result_batch.num_rows(), 3);
+        let col = result_batch.column(0);
+        assert!(!col.is_null(0));
+        assert!(col.is_null(1));
+        assert!(!col.is_null(2));
     }
 }

@@ -20,6 +20,7 @@ use http::header::CONTENT_TYPE;
 use crate::remote::client::{HttpSend, RestfulLanceDbClient, Sender};
 use crate::remote::table::RemoteTable;
 use crate::remote::ARROW_STREAM_CONTENT_TYPE;
+use crate::table::add_data::{IpcCompression, WriteProgressState};
 use crate::table::datafusion::insert::COUNT_SCHEMA;
 use crate::table::AddResult;
 use crate::Error;
@@ -39,6 +40,8 @@ pub struct RemoteInsertExec<S: HttpSend = Sender> {
     overwrite: bool,
     properties: PlanProperties,
     add_result: Arc<Mutex<Option<AddResult>>>,
+    progress: Option<Arc<WriteProgressState>>,
+    ipc_compression: IpcCompression,
 }
 
 impl<S: HttpSend + 'static> RemoteInsertExec<S> {
@@ -49,6 +52,8 @@ impl<S: HttpSend + 'static> RemoteInsertExec<S> {
         client: RestfulLanceDbClient<S>,
         input: Arc<dyn ExecutionPlan>,
         overwrite: bool,
+        progress: Option<Arc<WriteProgressState>>,
+        ipc_compression: IpcCompression,
     ) -> Self {
         let schema = COUNT_SCHEMA.clone();
         let properties = PlanProperties::new(
@@ -66,6 +71,8 @@ impl<S: HttpSend + 'static> RemoteInsertExec<S> {
             overwrite,
             properties,
             add_result: Arc::new(Mutex::new(None)),
+            progress,
+            ipc_compression,
         }
     }
 
@@ -76,9 +83,18 @@ impl<S: HttpSend + 'static> RemoteInsertExec<S> {
         self.add_result.lock().unwrap().clone()
     }
 
-    fn stream_as_body(data: SendableRecordBatchStream) -> DataFusionResult<reqwest::Body> {
-        let options = arrow_ipc::writer::IpcWriteOptions::default()
-            .try_with_compression(Some(CompressionType::LZ4_FRAME))?;
+    fn stream_as_body(
+        data: SendableRecordBatchStream,
+        progress: Option<Arc<WriteProgressState>>,
+        ipc_compression: IpcCompression,
+    ) -> DataFusionResult<reqwest::Body> {
+        let compression = match ipc_compression {
+            IpcCompression::Lz4Frame => Some(CompressionType::LZ4_FRAME),
+            IpcCompression::Zstd => Some(CompressionType::ZSTD),
+            IpcCompression::None => None,
+        };
+        let options =
+            arrow_ipc::writer::IpcWriteOptions::default().try_with_compression(compression)?;
         let writer = arrow_ipc::writer::StreamWriter::try_new_with_options(
             Vec::new(),
             &data.schema(),
@@ -86,25 +102,33 @@ impl<S: HttpSend + 'static> RemoteInsertExec<S> {
         )?;
 
         let stream = futures::stream::try_unfold((data, writer), move |(mut data, mut writer)| {
+            let progress = progress.clone();
             async move {
                 match data.next().await {
                     Some(Ok(batch)) => {
+                        let num_rows = batch.num_rows();
                         writer.write(&batch)?;
                         let buffer = std::mem::take(writer.get_mut());
+                        // Reports serialized IPC byte count, not in-memory size.
+                        if let Some(ref progress) = progress {
+                            progress.report(num_rows, buffer.len());
+                        }
                         Ok(Some((buffer, (data, writer))))
                     }
                     Some(Err(e)) => Err(e),
                     None => {
-                        if let Err(ArrowError::IpcError(_msg)) = writer.finish() {
-                            // Will error if already closed.
-                            return Ok(None);
-                        };
+                        match writer.finish() {
+                            Ok(()) => {}
+                            Err(ArrowError::IpcError(_)) => return Ok(None),
+                            Err(e) => return Err(DataFusionError::ArrowError(Box::new(e), None)),
+                        }
                         let buffer = std::mem::take(writer.get_mut());
                         Ok(Some((buffer, (data, writer))))
                     }
                 }
             }
-        });
+        })
+        .fuse();
 
         Ok(reqwest::Body::wrap_stream(stream))
     }
@@ -172,6 +196,8 @@ impl<S: HttpSend + 'static> ExecutionPlan for RemoteInsertExec<S> {
             self.client.clone(),
             children[0].clone(),
             self.overwrite,
+            self.progress.clone(),
+            self.ipc_compression,
         )))
     }
 
@@ -192,6 +218,8 @@ impl<S: HttpSend + 'static> ExecutionPlan for RemoteInsertExec<S> {
         let overwrite = self.overwrite;
         let add_result = self.add_result.clone();
         let table_name = self.table_name.clone();
+        let progress = self.progress.clone();
+        let ipc_compression = self.ipc_compression;
 
         let stream = futures::stream::once(async move {
             let mut request = client
@@ -202,7 +230,7 @@ impl<S: HttpSend + 'static> ExecutionPlan for RemoteInsertExec<S> {
                 request = request.query(&[("mode", "overwrite")]);
             }
 
-            let body = Self::stream_as_body(input_stream)?;
+            let body = Self::stream_as_body(input_stream, progress, ipc_compression)?;
             let request = request.body(body);
 
             let (request_id, response) = client
@@ -271,6 +299,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::remote::ARROW_STREAM_CONTENT_TYPE;
+    use crate::table::add_data::IpcCompression;
     use crate::table::datafusion::BaseTableAdapter;
     use crate::Table;
 
@@ -434,5 +463,105 @@ mod tests {
 
         // Verify: should have made exactly one HTTP request despite multiple input partitions
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// Unit-tests `stream_as_body` directly by consuming the reqwest body
+    /// stream and verifying the progress callback received correct cumulative
+    /// row and byte counts.
+    #[tokio::test]
+    async fn test_remote_insert_with_progress() {
+        use crate::table::add_data::{WriteProgress, WriteProgressState};
+        use datafusion_execution::SendableRecordBatchStream;
+        use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+        use std::sync::Mutex;
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            true,
+        )]));
+
+        let batches = vec![
+            record_batch!(("id", Int32, [1, 2])).unwrap(),
+            record_batch!(("id", Int32, [3, 4])).unwrap(),
+        ];
+        let stream = futures::stream::iter(batches.into_iter().map(Ok));
+        let record_batch_stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+
+        let updates: Arc<Mutex<Vec<WriteProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let updates_clone = updates.clone();
+        let progress = Arc::new(WriteProgressState::new(Arc::new(move |p| {
+            updates_clone.lock().unwrap().push(p);
+        })));
+
+        let body = super::RemoteInsertExec::<crate::remote::client::Sender>::stream_as_body(
+            record_batch_stream,
+            Some(progress),
+            IpcCompression::default(),
+        )
+        .unwrap();
+
+        // Consume the body to drive the stream.
+        use http_body_util::BodyExt;
+        let mut body: reqwest::Body = body;
+        while let Some(result) = body.frame().await {
+            result.unwrap();
+        }
+
+        let updates = updates.lock().unwrap();
+        assert!(
+            updates.len() >= 2,
+            "expected at least 2 progress updates for 2 batches, got {}",
+            updates.len(),
+        );
+        let last = updates.last().unwrap();
+        assert_eq!(last.rows_written, 4);
+        assert!(last.bytes_written > 0);
+        assert!(last.elapsed.as_nanos() > 0);
+    }
+
+    /// Helper to call `stream_as_body` with a given compression and consume the result.
+    async fn assert_stream_as_body_ok(compression: IpcCompression) {
+        use datafusion_execution::SendableRecordBatchStream;
+        use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            true,
+        )]));
+        let batches = vec![record_batch!(("id", Int32, [1, 2, 3])).unwrap()];
+        let stream = futures::stream::iter(batches.into_iter().map(Ok));
+        let record_batch_stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+
+        let body = super::RemoteInsertExec::<crate::remote::client::Sender>::stream_as_body(
+            record_batch_stream,
+            None,
+            compression,
+        )
+        .unwrap();
+
+        use http_body_util::BodyExt;
+        let mut body: reqwest::Body = body;
+        let mut total_bytes = 0usize;
+        while let Some(result) = body.frame().await {
+            let frame = result.unwrap();
+            if let Some(data) = frame.data_ref() {
+                total_bytes += data.len();
+            }
+        }
+        assert!(total_bytes > 0, "body should produce non-empty output");
+    }
+
+    #[tokio::test]
+    async fn test_stream_as_body_zstd() {
+        assert_stream_as_body_ok(IpcCompression::Zstd).await;
+    }
+
+    #[tokio::test]
+    async fn test_stream_as_body_no_compression() {
+        assert_stream_as_body_ok(IpcCompression::None).await;
     }
 }

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The LanceDB Authors
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +11,82 @@ use crate::embeddings::EmbeddingRegistry;
 use crate::Result;
 
 use super::{BaseTable, WriteOptions};
+
+/// Progress information reported during a write operation.
+///
+/// The meaning of `bytes_written` depends on the backend:
+/// - **Local tables**: approximate in-memory Arrow array size (not on-disk size).
+/// - **Remote tables**: serialized IPC byte count sent over the wire.
+///
+/// In both cases the value is a rough progress indicator, not an exact measure
+/// of bytes persisted to storage.
+#[derive(Debug, Clone)]
+pub struct WriteProgress {
+    /// Cumulative number of rows written so far.
+    pub rows_written: usize,
+    /// Cumulative bytes processed so far. See struct-level docs for semantics.
+    pub bytes_written: usize,
+    /// Elapsed time since the write operation started.
+    pub elapsed: std::time::Duration,
+}
+
+/// Tracks cumulative write progress and fires a callback after each batch.
+///
+/// Both counters are updated under a single lock so the callback always
+/// observes a consistent (rows, bytes) pair, even with concurrent partitions.
+pub struct WriteProgressState {
+    callback: Arc<dyn Fn(WriteProgress) + Send + Sync>,
+    counters: Mutex<(usize, usize)>,
+    start_time: Instant,
+}
+
+impl WriteProgressState {
+    pub fn new(callback: Arc<dyn Fn(WriteProgress) + Send + Sync>) -> Self {
+        Self {
+            callback,
+            counters: Mutex::new((0, 0)),
+            start_time: Instant::now(),
+        }
+    }
+
+    /// Increment counters and fire the callback with consistent cumulative totals.
+    pub fn report(&self, rows: usize, bytes: usize) {
+        let (rows_written, bytes_written) = {
+            let mut counters = self.counters.lock().unwrap();
+            counters.0 += rows;
+            counters.1 += bytes;
+            *counters
+        };
+        (self.callback)(WriteProgress {
+            rows_written,
+            bytes_written,
+            elapsed: self.start_time.elapsed(),
+        });
+    }
+}
+
+impl std::fmt::Debug for WriteProgressState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let counters = self.counters.lock().unwrap();
+        f.debug_struct("WriteProgressState")
+            .field("rows_written", &counters.0)
+            .field("bytes_written", &counters.1)
+            .finish()
+    }
+}
+
+/// IPC stream compression used when sending data to a remote LanceDB server.
+/// Has no effect on local tables.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum IpcCompression {
+    /// LZ4 frame compression (default).
+    #[default]
+    Lz4Frame,
+    /// Zstandard compression (better ratio, slightly slower).
+    Zstd,
+    /// No compression.
+    None,
+}
 
 #[derive(Debug, Clone, Default)]
 pub enum AddDataMode {
@@ -36,6 +113,8 @@ pub struct AddDataBuilder {
     pub(crate) mode: AddDataMode,
     pub(crate) write_options: WriteOptions,
     pub(crate) embedding_registry: Option<Arc<dyn EmbeddingRegistry>>,
+    pub(crate) progress_callback: Option<Arc<dyn Fn(WriteProgress) + Send + Sync>>,
+    pub(crate) ipc_compression: IpcCompression,
 }
 
 impl std::fmt::Debug for AddDataBuilder {
@@ -60,6 +139,8 @@ impl AddDataBuilder {
             mode: AddDataMode::Append,
             write_options: WriteOptions::default(),
             embedding_registry,
+            progress_callback: None,
+            ipc_compression: IpcCompression::default(),
         }
     }
 
@@ -70,6 +151,19 @@ impl AddDataBuilder {
 
     pub fn write_options(mut self, options: WriteOptions) -> Self {
         self.write_options = options;
+        self
+    }
+
+    /// Set a callback to receive progress updates during the write operation.
+    pub fn progress(mut self, callback: impl Fn(WriteProgress) + Send + Sync + 'static) -> Self {
+        self.progress_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// Set the IPC compression used when sending data to a remote server.
+    /// Has no effect on local tables. Defaults to LZ4 frame compression.
+    pub fn ipc_compression(mut self, compression: IpcCompression) -> Self {
+        self.ipc_compression = compression;
         self
     }
 
@@ -98,7 +192,7 @@ mod tests {
     use crate::test_utils::embeddings::MockEmbed;
     use crate::Error;
 
-    use super::AddDataMode;
+    use super::{AddDataMode, WriteProgress};
 
     async fn create_test_table() -> Table {
         let conn = connect("memory://").execute().await.unwrap();
@@ -338,5 +432,32 @@ mod tests {
             let embedding_col = batch.column(1);
             assert_eq!(embedding_col.null_count(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn test_add_with_progress() {
+        let updates: Arc<std::sync::Mutex<Vec<WriteProgress>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let updates_clone = updates.clone();
+
+        let table = create_test_table().await;
+        let batch = record_batch!(("id", Int64, [4, 5])).unwrap();
+        table
+            .add(batch)
+            .progress(move |p| {
+                updates_clone.lock().unwrap().push(p);
+            })
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(table.count_rows(None).await.unwrap(), 5);
+
+        let updates = updates.lock().unwrap();
+        assert!(!updates.is_empty(), "should have received progress updates");
+        let last = updates.last().unwrap();
+        assert!(last.rows_written > 0);
+        assert!(last.bytes_written > 0);
+        assert!(last.elapsed.as_nanos() > 0);
     }
 }

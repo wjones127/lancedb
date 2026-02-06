@@ -52,6 +52,11 @@ impl FieldPath {
 
     /// Extract the array at this path from a [`RecordBatch`].
     pub fn extract(&self, batch: &RecordBatch) -> Result<ArrayRef> {
+        if self.0.is_empty() {
+            return Err(Error::InvalidInput {
+                message: "FieldPath is empty".to_string(),
+            });
+        }
         let mut arr: ArrayRef = batch.column(self.0[0]).clone();
         for &idx in &self.0[1..] {
             let struct_arr = arr.as_struct();
@@ -81,7 +86,7 @@ fn is_numeric_element(dt: &DataType) -> bool {
 /// Walk a schema recursively and find fields that look like vector candidates.
 ///
 /// A field is a candidate if ALL of:
-/// - Type is `List`, `LargeList`, or `ListView`
+/// - Type is `List` or `LargeList`
 /// - Element type is integer or float
 /// - Name contains "vector" or "embedding" (case insensitive)
 ///
@@ -117,9 +122,7 @@ fn find_candidates_recursive(
 
 fn is_variable_list_with_numeric_elements(dt: &DataType) -> bool {
     match dt {
-        DataType::List(f) | DataType::LargeList(f) | DataType::ListView(f) => {
-            is_numeric_element(f.data_type())
-        }
+        DataType::List(f) | DataType::LargeList(f) => is_numeric_element(f.data_type()),
         _ => false,
     }
 }
@@ -189,6 +192,9 @@ async fn peek_stream(
 }
 
 /// Determine the target element type for an integer list column based on peeked values.
+///
+/// NOTE: This only inspects the first batch. Values outside the first batch's range
+/// (e.g., >255 when the first batch fits in UInt8) will cause a cast error downstream.
 fn infer_integer_element_type(arr: &dyn Array) -> DataType {
     let Some(flat) = flatten_list_values(arr) else {
         return DataType::UInt8;
@@ -288,9 +294,7 @@ pub async fn infer_vector_schema(
         let dim = modal_list_length(arr.as_ref())?;
 
         let element_dt = match field.data_type() {
-            DataType::List(f) | DataType::LargeList(f) | DataType::ListView(f) => {
-                f.data_type().clone()
-            }
+            DataType::List(f) | DataType::LargeList(f) => f.data_type().clone(),
             _ => unreachable!(),
         };
 

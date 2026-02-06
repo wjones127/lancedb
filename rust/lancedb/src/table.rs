@@ -55,7 +55,7 @@ use std::format;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::data::scannable::{MaybeEmbeddedScannable, Scannable};
+use crate::data::scannable::Scannable;
 use crate::database::Database;
 use crate::embeddings::{EmbeddingDefinition, EmbeddingRegistry, MemoryRegistry};
 use crate::error::{Error, Result};
@@ -76,12 +76,14 @@ use crate::utils::{
 use self::dataset::DatasetConsistencyWrapper;
 use self::merge::MergeInsertBuilder;
 
-mod add_data;
+pub mod add_data;
 pub mod datafusion;
 pub(crate) mod dataset;
 pub mod merge;
 
-pub use add_data::{AddDataBuilder, AddDataMode, AddResult};
+pub use add_data::{
+    AddDataBuilder, AddDataMode, AddResult, IpcCompression, WriteProgress, WriteProgressState,
+};
 
 use crate::index::waiter::wait_for_index;
 pub use chrono::Duration;
@@ -118,10 +120,38 @@ pub struct TableDefinition {
 
 impl TableDefinition {
     pub fn new(schema: SchemaRef, column_definitions: Vec<ColumnDefinition>) -> Self {
+        debug_assert_eq!(
+            column_definitions.len(),
+            schema.fields().len(),
+            "column_definitions length ({}) must match schema fields length ({})",
+            column_definitions.len(),
+            schema.fields().len(),
+        );
         Self {
             column_definitions,
             schema,
         }
+    }
+
+    /// Creates a [`TableDefinition`] with validation, returning an error if
+    /// `column_definitions.len()` does not match `schema.fields().len()`.
+    ///
+    /// Prefer [`TableDefinition::new`] when the caller can guarantee the
+    /// lengths match (e.g. when both are derived from the same source).
+    pub fn try_new(schema: SchemaRef, column_definitions: Vec<ColumnDefinition>) -> Result<Self> {
+        if column_definitions.len() != schema.fields().len() {
+            return Err(Error::InvalidInput {
+                message: format!(
+                    "column_definitions length ({}) must match schema fields length ({})",
+                    column_definitions.len(),
+                    schema.fields().len(),
+                ),
+            });
+        }
+        Ok(Self {
+            column_definitions,
+            schema,
+        })
     }
 
     pub fn new_from_schema(schema: SchemaRef) -> Self {
@@ -142,16 +172,9 @@ impl TableDefinition {
                 serde_json::from_str(column_definitions).map_err(|e| Error::Runtime {
                     message: format!("Failed to deserialize column definitions: {}", e),
                 })?;
-            Ok(Self::new(schema, column_definitions))
+            Self::try_new(schema, column_definitions)
         } else {
-            let column_definitions = schema
-                .fields()
-                .iter()
-                .map(|_| ColumnDefinition {
-                    kind: ColumnKind::Physical,
-                })
-                .collect();
-            Ok(Self::new(schema, column_definitions))
+            Ok(Self::new_from_schema(schema))
         }
     }
 
@@ -2698,6 +2721,8 @@ impl BaseTable for NativeTable {
     }
 
     async fn add(&self, add: AddDataBuilder) -> Result<AddResult> {
+        self.dataset.ensure_mutable().await?;
+
         let lance_params = add.write_options.lance_write_params.unwrap_or(WriteParams {
             mode: match add.mode {
                 AddDataMode::Append => WriteMode::Append,
@@ -2706,24 +2731,50 @@ impl BaseTable for NativeTable {
             ..Default::default()
         });
 
-        // Apply embeddings if configured
-        let table_def = self.table_definition().await?;
-        let data: Box<dyn Scannable> = Box::new(MaybeEmbeddedScannable::try_new(
-            add.data,
-            &table_def,
-            add.embedding_registry.as_ref(),
-        )?);
+        // Build source plan from Scannable
+        let source: Arc<dyn ExecutionPlan> =
+            Arc::new(datafusion::scannable_exec::ScannableExec::new(add.data));
 
-        let dataset = {
-            // Limited scope for the mutable borrow of self.dataset avoids deadlock.
-            let ds = self.dataset.get_mut().await?;
-            InsertBuilder::new(Arc::new(ds.clone()))
-                .with_params(&lance_params)
-                .execute_stream(data)
-                .await?
+        // Determine effective mode (lance_write_params may override AddDataMode)
+        let effective_mode = if matches!(lance_params.mode, WriteMode::Overwrite) {
+            AddDataMode::Overwrite
+        } else {
+            add.mode
         };
-        let version = dataset.manifest().version;
-        self.dataset.set_latest(dataset).await;
+
+        // Add embedding projection + schema cast
+        let plan = datafusion::pipeline::build_processing_pipeline(
+            source,
+            self,
+            add.embedding_registry.as_ref(),
+            &effective_mode,
+        )
+        .await?;
+
+        // Add insert exec
+        let progress = add
+            .progress_callback
+            .map(|cb| Arc::new(add_data::WriteProgressState::new(cb)));
+        let ds = self.dataset.get().await?;
+        let dataset = Arc::new((*ds).clone());
+        drop(ds);
+        let insert = Arc::new(datafusion::insert::InsertExec::new(
+            self.dataset.clone(),
+            dataset,
+            plan,
+            lance_params,
+            progress,
+        ));
+
+        // Execute
+        let ctx = ::datafusion::prelude::SessionContext::new();
+        datafusion_physical_plan::collect(insert, ctx.task_ctx())
+            .await
+            .map_err(|e| Error::Runtime {
+                message: e.to_string(),
+            })?;
+
+        let version = self.dataset.get().await?.manifest().version;
         Ok(AddResult { version })
     }
 
@@ -3327,6 +3378,7 @@ impl BaseTable for NativeTable {
             dataset,
             input,
             write_params,
+            None,
         )))
     }
 }
@@ -5035,5 +5087,33 @@ mod tests {
 
         // Should have an empty vector
         assert!(ns_request.vector.single_vector.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_table_definition_try_new_length_mismatch() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+
+        let result = TableDefinition::try_new(
+            schema,
+            vec![ColumnDefinition {
+                kind: ColumnKind::Physical,
+            }],
+        );
+
+        match result {
+            Err(Error::InvalidInput { message }) => {
+                assert!(
+                    message.contains(
+                        "column_definitions length (1) must match schema fields length (2)"
+                    ),
+                    "Unexpected error message: {}",
+                    message,
+                );
+            }
+            other => panic!("Expected InvalidInput error, got: {:?}", other),
+        }
     }
 }
