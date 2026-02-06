@@ -117,7 +117,21 @@ pub struct TableDefinition {
 }
 
 impl TableDefinition {
-    pub fn new(schema: SchemaRef, column_definitions: Vec<ColumnDefinition>) -> Result<Self> {
+    pub fn new(schema: SchemaRef, column_definitions: Vec<ColumnDefinition>) -> Self {
+        debug_assert_eq!(
+            column_definitions.len(),
+            schema.fields().len(),
+            "column_definitions length ({}) must match schema fields length ({})",
+            column_definitions.len(),
+            schema.fields().len(),
+        );
+        Self {
+            column_definitions,
+            schema,
+        }
+    }
+
+    pub fn try_new(schema: SchemaRef, column_definitions: Vec<ColumnDefinition>) -> Result<Self> {
         if column_definitions.len() != schema.fields().len() {
             return Err(Error::InvalidInput {
                 message: format!(
@@ -141,8 +155,7 @@ impl TableDefinition {
                 kind: ColumnKind::Physical,
             })
             .collect();
-        // Length is guaranteed to match since we derive from the schema itself.
-        Self::new(schema, column_definitions).unwrap()
+        Self::new(schema, column_definitions)
     }
 
     pub fn try_from_rich_schema(schema: SchemaRef) -> Result<Self> {
@@ -152,7 +165,7 @@ impl TableDefinition {
                 serde_json::from_str(column_definitions).map_err(|e| Error::Runtime {
                     message: format!("Failed to deserialize column definitions: {}", e),
                 })?;
-            Self::new(schema, column_definitions)
+            Self::try_new(schema, column_definitions)
         } else {
             Ok(Self::new_from_schema(schema))
         }
@@ -5038,5 +5051,33 @@ mod tests {
 
         // Should have an empty vector
         assert!(ns_request.vector.single_vector.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_table_definition_try_new_length_mismatch() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+
+        let result = TableDefinition::try_new(
+            schema,
+            vec![ColumnDefinition {
+                kind: ColumnKind::Physical,
+            }],
+        );
+
+        match result {
+            Err(Error::InvalidInput { message }) => {
+                assert!(
+                    message.contains(
+                        "column_definitions length (1) must match schema fields length (2)"
+                    ),
+                    "Unexpected error message: {}",
+                    message,
+                );
+            }
+            other => panic!("Expected InvalidInput error, got: {:?}", other),
+        }
     }
 }

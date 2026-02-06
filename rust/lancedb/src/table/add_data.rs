@@ -304,8 +304,7 @@ mod tests {
                     kind: ColumnKind::Embedding(embedding_def),
                 },
             ],
-        )
-        .unwrap();
+        );
         let rich_schema = table_def.into_rich_schema();
 
         let table = conn

@@ -82,6 +82,9 @@ pub struct InsertExec {
     properties: PlanProperties,
     partial_transactions: Arc<Mutex<Vec<Transaction>>>,
     any_partition_failed: Arc<AtomicBool>,
+    /// Ensures shared state is reset exactly once per execution, regardless of
+    /// which partition calls `execute` first.
+    did_reset: AtomicBool,
 }
 
 impl InsertExec {
@@ -108,6 +111,7 @@ impl InsertExec {
             properties,
             partial_transactions: Arc::new(Mutex::new(Vec::with_capacity(num_partitions))),
             any_partition_failed: Arc::new(AtomicBool::new(false)),
+            did_reset: AtomicBool::new(false),
         }
     }
 }
@@ -175,7 +179,11 @@ impl ExecutionPlan for InsertExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        if partition == 0 {
+        if self
+            .did_reset
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
             self.any_partition_failed.store(false, Ordering::SeqCst);
             self.partial_transactions.lock().unwrap().clear();
         }
