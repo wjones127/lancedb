@@ -491,7 +491,7 @@ fn convert_list_to_fsl(
 }
 
 /// Extract per-row offsets (as i64) and the flat values buffer from a list array.
-fn get_list_offsets_and_values(arr: &dyn Array) -> Result<(Vec<i64>, ArrayRef)> {
+pub fn get_list_offsets_and_values(arr: &dyn Array) -> Result<(Vec<i64>, ArrayRef)> {
     match arr.data_type() {
         DataType::List(_) => {
             let list = arr.as_list::<i32>();
@@ -510,7 +510,7 @@ fn get_list_offsets_and_values(arr: &dyn Array) -> Result<(Vec<i64>, ArrayRef)> 
 }
 
 /// Build a FixedSizeList from pre-cast flat values using list offsets.
-fn build_fsl_from_offsets<B: ArrowValueBuilder>(
+pub fn build_fsl_from_offsets<B: ArrowValueBuilder>(
     arr: &dyn Array,
     offsets: &[i64],
     cast_values: &B::ArrayType,
@@ -558,7 +558,7 @@ fn build_fsl_from_offsets<B: ArrowValueBuilder>(
 }
 
 /// Trait abstracting over Float32Builder and UInt8Builder for generic FSL construction.
-trait ArrowValueBuilder: ArrayBuilder {
+pub trait ArrowValueBuilder: ArrayBuilder {
     type ArrayType: Array;
 
     fn builder_with_capacity(capacity: usize) -> Self;
