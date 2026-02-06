@@ -152,10 +152,9 @@ impl PhysicalExpr for CastToFixedSizeListExpr {
             DataType::List(_) | DataType::LargeList(_) => {
                 let (offsets, flat_values) = get_list_offsets_and_values(array.as_ref())
                     .map_err(|e| datafusion_common::DataFusionError::External(e.into()))?;
-                let cast_values = cast(&flat_values, inner_type)?;
-
                 match inner_type {
                     DataType::Float32 => {
+                        let cast_values = cast(&flat_values, inner_type)?;
                         let typed = cast_values.as_primitive::<arrow_array::types::Float32Type>();
                         build_fsl_from_offsets::<arrow_array::builder::Float32Builder>(
                             array.as_ref(),
@@ -167,6 +166,7 @@ impl PhysicalExpr for CastToFixedSizeListExpr {
                         .map_err(|e| datafusion_common::DataFusionError::External(e.into()))?
                     }
                     DataType::Float64 => {
+                        let cast_values = cast(&flat_values, inner_type)?;
                         let typed = cast_values.as_primitive::<arrow_array::types::Float64Type>();
                         build_fsl_from_offsets::<arrow_array::builder::Float64Builder>(
                             array.as_ref(),
@@ -178,6 +178,7 @@ impl PhysicalExpr for CastToFixedSizeListExpr {
                         .map_err(|e| datafusion_common::DataFusionError::External(e.into()))?
                     }
                     DataType::UInt8 => {
+                        let cast_values = cast(&flat_values, inner_type)?;
                         let typed = cast_values
                             .as_any()
                             .downcast_ref::<arrow_array::UInt8Array>()
@@ -192,7 +193,8 @@ impl PhysicalExpr for CastToFixedSizeListExpr {
                         .map_err(|e| datafusion_common::DataFusionError::External(e.into()))?
                     }
                     DataType::Float16 => {
-                        // Float16 is a subset of Float32, so build via Float32 then cast
+                        // Cast to Float32 first since arrow doesn't support direct
+                        // cast from most types to Float16.
                         let f32_values = cast(&flat_values, &DataType::Float32)?;
                         let typed = f32_values.as_primitive::<arrow_array::types::Float32Type>();
                         let fsl = build_fsl_from_offsets::<arrow_array::builder::Float32Builder>(
@@ -889,6 +891,26 @@ mod tests {
             DataType::FixedSizeList(field, _) => assert!(!field.is_nullable()),
             _ => panic!("expected FSL"),
         }
+    }
+
+    #[test]
+    fn test_list_f32_to_fsl_f16() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vec",
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![make_list_f32(&[Some(vec![1.0, 2.0]), Some(vec![3.0, 4.0])])],
+        )
+        .unwrap();
+
+        let expr = CastToFixedSizeListExpr::new(source_col(), 2, DataType::Float16);
+        let result = eval_expr(&expr, &batch);
+        let fsl = result.as_fixed_size_list();
+        assert_eq!(fsl.len(), 2);
+        assert_eq!(fsl.value_type(), DataType::Float16);
     }
 
     #[test]
