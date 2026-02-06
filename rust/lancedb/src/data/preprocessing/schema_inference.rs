@@ -589,6 +589,27 @@ impl ArrowValueBuilder for Float32Builder {
     }
 }
 
+impl ArrowValueBuilder for arrow_array::builder::Float64Builder {
+    type ArrayType = arrow_array::Float64Array;
+
+    fn builder_with_capacity(capacity: usize) -> Self {
+        Self::with_capacity(capacity)
+    }
+    fn append_nulls_n(builder: &mut Self, count: usize) {
+        builder.append_nulls(count);
+    }
+    fn append_fill(builder: &mut Self, count: usize, value: f64) {
+        for _ in 0..count {
+            builder.append_value(value);
+        }
+    }
+    fn copy_range(builder: &mut Self, source: &Self::ArrayType, start: usize, len: usize) {
+        for j in 0..len {
+            builder.append_value(source.value(start + j));
+        }
+    }
+}
+
 impl ArrowValueBuilder for UInt8Builder {
     type ArrayType = UInt8Array;
 

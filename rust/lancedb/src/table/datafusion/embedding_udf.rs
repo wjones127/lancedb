@@ -4,6 +4,7 @@
 //! DataFusion physical expression and projection for computing embeddings.
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -154,13 +155,41 @@ pub fn build_embedding_projection(
         .collect();
 
     let mut added = false;
+    let mut seen_dest_names: HashSet<String> = HashSet::new();
     for (def, func) in embeddings {
         let dest_name = def
             .dest_column
             .clone()
             .unwrap_or_else(|| format!("{}_embedding", def.source_column));
 
-        if input_schema.field_with_name(&dest_name).is_ok() {
+        if !seen_dest_names.insert(dest_name.clone()) {
+            return Err(DataFusionError::Plan(format!(
+                "duplicate embedding destination column '{}'",
+                dest_name
+            )));
+        }
+
+        if let Ok(existing_field) = input_schema.field_with_name(&dest_name) {
+            let expected_type = func
+                .dest_type()
+                .map_err(|e| DataFusionError::External(e.into()))?
+                .into_owned();
+            // Normalize FSL nullability for comparison (DataFusion normalizes to nullable)
+            let normalized_expected = match &expected_type {
+                DataType::FixedSizeList(inner, dim) => DataType::FixedSizeList(
+                    Arc::new(Field::new(inner.name(), inner.data_type().clone(), true)),
+                    *dim,
+                ),
+                other => other.clone(),
+            };
+            if *existing_field.data_type() != normalized_expected {
+                return Err(DataFusionError::Plan(format!(
+                    "existing column '{}' has type {:?}, but embedding function produces {:?}",
+                    dest_name,
+                    existing_field.data_type(),
+                    normalized_expected,
+                )));
+            }
             continue;
         }
 
@@ -259,8 +288,50 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_projection_skips_existing() {
+        let fsl_type =
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4);
         let schema = Arc::new(Schema::new(vec![
             Field::new("text", DataType::Utf8, false),
+            Field::new("text_vec", fsl_type, true),
+        ]));
+
+        // Build an FSL column with the right type
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+        let mut fsl_builder = FixedSizeListBuilder::new(Float32Builder::with_capacity(8), 4);
+        for _ in 0..2 {
+            for v in &[1.0_f32, 2.0, 3.0, 4.0] {
+                fsl_builder.values().append_value(*v);
+            }
+            fsl_builder.append(true);
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["hello", "world"])),
+                Arc::new(fsl_builder.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let mock: Arc<dyn EmbeddingFunction> = Arc::new(MockEmbed::new("test", 4));
+        let def = EmbeddingDefinition::new("text", "test", Some("text_vec"));
+
+        let mem_table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(mem_table)).unwrap();
+        let df = ctx.sql("SELECT * FROM t").await.unwrap();
+        let input = df.create_physical_plan().await.unwrap();
+
+        let result_plan = build_embedding_projection(input.clone(), &[(def, mock)]).unwrap();
+        // Should return input unchanged since dest column already exists
+        assert!(Arc::ptr_eq(&result_plan, &input));
+    }
+
+    #[tokio::test]
+    async fn test_build_projection_rejects_type_mismatch() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("text", DataType::Utf8, false),
+            // Existing column with wrong type (Float32 scalar instead of FSL)
             Field::new("text_vec", DataType::Float32, true),
         ]));
         let batch = RecordBatch::try_new(
@@ -281,9 +352,34 @@ mod tests {
         let df = ctx.sql("SELECT * FROM t").await.unwrap();
         let input = df.create_physical_plan().await.unwrap();
 
-        let result_plan = build_embedding_projection(input.clone(), &[(def, mock)]).unwrap();
-        // Should return input unchanged since dest column already exists
-        assert!(Arc::ptr_eq(&result_plan, &input));
+        let result = build_embedding_projection(input, &[(def, mock)]);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("text_vec"), "error should mention column name");
+    }
+
+    #[tokio::test]
+    async fn test_build_projection_rejects_duplicate_dest() {
+        let (schema, batch) = make_text_batch();
+        let mock1: Arc<dyn EmbeddingFunction> = Arc::new(MockEmbed::new("test1", 4));
+        let mock2: Arc<dyn EmbeddingFunction> = Arc::new(MockEmbed::new("test2", 4));
+        let def1 = EmbeddingDefinition::new("text", "test1", Some("output"));
+        let def2 = EmbeddingDefinition::new("text", "test2", Some("output"));
+
+        let mem_table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(mem_table)).unwrap();
+        let df = ctx.sql("SELECT * FROM t").await.unwrap();
+        let input = df.create_physical_plan().await.unwrap();
+
+        let result = build_embedding_projection(input, &[(def1, mock1), (def2, mock2)]);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate"),
+            "error should mention duplicate: {}",
+            err
+        );
     }
 
     #[tokio::test]

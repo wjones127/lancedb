@@ -342,6 +342,120 @@ mod tests {
         assert_eq!(batches[0].num_rows(), 2);
     }
 
+    fn list_f32_schema(dim_hint: &str) -> Arc<Schema> {
+        let _ = dim_hint; // just for readability at call sites
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vec",
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                true,
+            ),
+        ]))
+    }
+
+    fn make_list_f32(values: &[Option<Vec<f32>>]) -> ArrayRef {
+        use arrow_array::builder::{Float32Builder, ListBuilder};
+        let mut builder = ListBuilder::new(Float32Builder::new());
+        for row in values {
+            match row {
+                Some(vals) => {
+                    for v in vals {
+                        builder.values().append_value(*v);
+                    }
+                    builder.append(true);
+                }
+                None => {
+                    builder.append(false);
+                }
+            }
+        }
+        Arc::new(builder.finish())
+    }
+
+    fn make_large_list_f32(values: &[Option<Vec<f32>>]) -> ArrayRef {
+        use arrow_array::builder::{Float32Builder, LargeListBuilder};
+        let mut builder = LargeListBuilder::new(Float32Builder::new());
+        for row in values {
+            match row {
+                Some(vals) => {
+                    for v in vals {
+                        builder.values().append_value(*v);
+                    }
+                    builder.append(true);
+                }
+                None => {
+                    builder.append(false);
+                }
+            }
+        }
+        Arc::new(builder.finish())
+    }
+
+    #[tokio::test]
+    async fn test_null_strategy_list() {
+        let schema = list_f32_schema("3");
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                make_list_f32(&[
+                    Some(vec![1.0, 2.0, 3.0]),
+                    Some(vec![f32::NAN, 5.0, 6.0]),
+                    Some(vec![7.0, 8.0, 9.0]),
+                ]),
+            ],
+        )
+        .unwrap();
+
+        let batches = run_preprocessing(schema, batch, NanStrategy::Null)
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let result = &batches[0];
+        assert_eq!(result.num_rows(), 3);
+        let col = result.column(1);
+        assert!(!col.is_null(0));
+        assert!(col.is_null(1)); // NaN row → null
+        assert!(!col.is_null(2));
+    }
+
+    #[tokio::test]
+    async fn test_drop_strategy_large_list() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vec",
+                DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true))),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                make_large_list_f32(&[
+                    Some(vec![1.0, 2.0, 3.0]),
+                    Some(vec![f32::NAN, 5.0, 6.0]),
+                    Some(vec![7.0, 8.0, 9.0]),
+                ]),
+            ],
+        )
+        .unwrap();
+
+        let batches = run_preprocessing(schema, batch, NanStrategy::Drop)
+            .await
+            .unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+
+        let ids = batches[0]
+            .column(0)
+            .as_primitive::<arrow_array::types::Int32Type>();
+        assert_eq!(ids.value(0), 1);
+        assert_eq!(ids.value(1), 3);
+    }
+
     #[tokio::test]
     async fn test_clean_data_passthrough() {
         let schema = fsl_schema(3);

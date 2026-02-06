@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray};
 use arrow_cast::cast;
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion_common::Result as DataFusionResult;
 
 type DFResult<T> = DataFusionResult<T>;
@@ -31,14 +31,14 @@ use crate::data::preprocessing::{
 pub struct CastToFixedSizeListExpr {
     source: Arc<dyn PhysicalExpr>,
     dimension: i32,
-    inner_type: DataType,
+    inner_field: FieldRef,
 }
 
 impl PartialEq for CastToFixedSizeListExpr {
     fn eq(&self, other: &Self) -> bool {
         self.source.eq(&other.source)
             && self.dimension == other.dimension
-            && self.inner_type == other.inner_type
+            && self.inner_field == other.inner_field
     }
 }
 
@@ -46,7 +46,7 @@ impl Hash for CastToFixedSizeListExpr {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.source.hash(state);
         self.dimension.hash(state);
-        self.inner_type.hash(state);
+        self.inner_field.hash(state);
     }
 }
 
@@ -55,7 +55,9 @@ impl fmt::Display for CastToFixedSizeListExpr {
         write!(
             f,
             "CastToFSL({}, dim={}, inner={})",
-            self.source, self.dimension, self.inner_type
+            self.source,
+            self.dimension,
+            self.inner_field.data_type()
         )
     }
 }
@@ -65,7 +67,7 @@ impl CastToFixedSizeListExpr {
         Self {
             source,
             dimension,
-            inner_type,
+            inner_field: Arc::new(Field::new("item", inner_type, true)),
         }
     }
 
@@ -74,13 +76,19 @@ impl CastToFixedSizeListExpr {
         target: &DataType,
     ) -> crate::Result<Self> {
         match target {
-            DataType::FixedSizeList(inner, dim) => {
-                Ok(Self::new(source, *dim, inner.data_type().clone()))
-            }
+            DataType::FixedSizeList(inner, dim) => Ok(Self {
+                source,
+                dimension: *dim,
+                inner_field: inner.clone(),
+            }),
             _ => Err(crate::Error::InvalidInput {
                 message: format!("expected FixedSizeList target type, got {:?}", target),
             }),
         }
+    }
+
+    fn inner_type(&self) -> &DataType {
+        self.inner_field.data_type()
     }
 
     fn cast_fsl(&self, fsl: &FixedSizeListArray) -> datafusion_common::Result<ArrayRef> {
@@ -92,13 +100,16 @@ impl CastToFixedSizeListExpr {
             )));
         }
         let values = fsl.values();
-        if *values.data_type() == self.inner_type {
+        if *values.data_type() == *self.inner_type() {
             return Ok(Arc::new(fsl.clone()));
         }
-        let cast_values = cast(values, &self.inner_type)?;
-        let field = Arc::new(Field::new("item", self.inner_type.clone(), true));
-        let new_fsl =
-            FixedSizeListArray::new(field, self.dimension, cast_values, fsl.nulls().cloned());
+        let cast_values = cast(values, self.inner_type())?;
+        let new_fsl = FixedSizeListArray::new(
+            self.inner_field.clone(),
+            self.dimension,
+            cast_values,
+            fsl.nulls().cloned(),
+        );
         Ok(Arc::new(new_fsl))
     }
 }
@@ -110,7 +121,7 @@ impl PhysicalExpr for CastToFixedSizeListExpr {
 
     fn data_type(&self, _input_schema: &Schema) -> DFResult<DataType> {
         Ok(DataType::FixedSizeList(
-            Arc::new(Field::new("item", self.inner_type.clone(), true)),
+            self.inner_field.clone(),
             self.dimension,
         ))
     }
@@ -122,17 +133,29 @@ impl PhysicalExpr for CastToFixedSizeListExpr {
     fn evaluate(&self, batch: &arrow_array::RecordBatch) -> DFResult<ColumnarValue> {
         let source_value = self.source.evaluate(batch)?;
         let array = source_value.into_array(batch.num_rows())?;
+        let inner_type = self.inner_type();
 
         let result = match array.data_type() {
             DataType::List(_) | DataType::LargeList(_) => {
                 let (offsets, flat_values) = get_list_offsets_and_values(array.as_ref())
                     .map_err(|e| datafusion_common::DataFusionError::External(e.into()))?;
-                let cast_values = cast(&flat_values, &self.inner_type)?;
+                let cast_values = cast(&flat_values, inner_type)?;
 
-                match &self.inner_type {
+                match inner_type {
                     DataType::Float32 => {
                         let typed = cast_values.as_primitive::<arrow_array::types::Float32Type>();
                         build_fsl_from_offsets::<arrow_array::builder::Float32Builder>(
+                            array.as_ref(),
+                            &offsets,
+                            typed,
+                            self.dimension as i64,
+                            &BadVectorStrategy::Null,
+                        )
+                        .map_err(|e| datafusion_common::DataFusionError::External(e.into()))?
+                    }
+                    DataType::Float64 => {
+                        let typed = cast_values.as_primitive::<arrow_array::types::Float64Type>();
+                        build_fsl_from_offsets::<arrow_array::builder::Float64Builder>(
                             array.as_ref(),
                             &offsets,
                             typed,
@@ -156,10 +179,21 @@ impl PhysicalExpr for CastToFixedSizeListExpr {
                         .map_err(|e| datafusion_common::DataFusionError::External(e.into()))?
                     }
                     _ => {
-                        return Err(datafusion_common::DataFusionError::Execution(format!(
-                            "unsupported inner type for FSL cast: {:?}",
-                            self.inner_type
-                        )));
+                        // Fallback: build as Float32, then cast inner values to target type
+                        let f32_values = cast(&flat_values, &DataType::Float32)?;
+                        let typed = f32_values.as_primitive::<arrow_array::types::Float32Type>();
+                        let fsl = build_fsl_from_offsets::<arrow_array::builder::Float32Builder>(
+                            array.as_ref(),
+                            &offsets,
+                            typed,
+                            self.dimension as i64,
+                            &BadVectorStrategy::Null,
+                        )
+                        .map_err(|e| datafusion_common::DataFusionError::External(e.into()))?;
+                        // Cast the FSL to the target inner type
+                        let target_dt =
+                            DataType::FixedSizeList(self.inner_field.clone(), self.dimension);
+                        cast(&fsl, &target_dt)?
                     }
                 }
             }
@@ -202,11 +236,11 @@ impl PhysicalExpr for CastToFixedSizeListExpr {
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> DFResult<Arc<dyn PhysicalExpr>> {
-        Ok(Arc::new(Self::new(
-            children[0].clone(),
-            self.dimension,
-            self.inner_type.clone(),
-        )))
+        Ok(Arc::new(Self {
+            source: children[0].clone(),
+            dimension: self.dimension,
+            inner_field: self.inner_field.clone(),
+        }))
     }
 
     fn fmt_sql(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -218,10 +252,11 @@ fn schemas_equal(a: &Schema, b: &Schema) -> bool {
     if a.fields().len() != b.fields().len() {
         return false;
     }
-    a.fields()
-        .iter()
-        .zip(b.fields().iter())
-        .all(|(af, bf)| af.name() == bf.name() && af.data_type() == bf.data_type())
+    a.fields().iter().zip(b.fields().iter()).all(|(af, bf)| {
+        af.name() == bf.name()
+            && af.data_type() == bf.data_type()
+            && af.is_nullable() == bf.is_nullable()
+    })
 }
 
 fn needs_fsl_conversion(source_type: &DataType, target_type: &DataType) -> bool {
@@ -258,7 +293,9 @@ pub fn create_schema_cast_projection(
         let source_field = input_schema.field(source_idx);
         let col_expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new(name, source_idx));
 
-        if source_field.data_type() == target_field.data_type() {
+        if source_field.data_type() == target_field.data_type()
+            && source_field.is_nullable() == target_field.is_nullable()
+        {
             projections.push((col_expr, name.clone()));
         } else if needs_fsl_conversion(source_field.data_type(), target_field.data_type()) {
             let cast_expr = CastToFixedSizeListExpr::try_new_from_target_type(
@@ -577,6 +614,134 @@ mod tests {
         let result = create_schema_cast_projection(input.clone(), &schema).unwrap();
         // Should return input unchanged (same Arc)
         assert!(Arc::ptr_eq(&result, &input));
+    }
+
+    #[test]
+    fn test_list_f64_to_fsl_f64() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vec",
+            DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![make_list_f64(&[Some(vec![1.0, 2.0]), Some(vec![3.0, 4.0])])],
+        )
+        .unwrap();
+
+        let expr = CastToFixedSizeListExpr::new(source_col(), 2, DataType::Float64);
+        let result = eval_expr(&expr, &batch);
+        let fsl = result.as_fixed_size_list();
+        assert_eq!(fsl.len(), 2);
+        assert_eq!(fsl.value_type(), DataType::Float64);
+        let row0 = fsl.value(0);
+        let vals = row0.as_primitive::<arrow_array::types::Float64Type>();
+        assert_eq!(vals.value(0), 1.0);
+        assert_eq!(vals.value(1), 2.0);
+    }
+
+    #[test]
+    fn test_list_f32_to_fsl_u8() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vec",
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![make_list_f32(&[
+                Some(vec![1.0, 2.0, 3.0]),
+                Some(vec![100.0, 200.0, 255.0]),
+            ])],
+        )
+        .unwrap();
+
+        let expr = CastToFixedSizeListExpr::new(source_col(), 3, DataType::UInt8);
+        let result = eval_expr(&expr, &batch);
+        let fsl = result.as_fixed_size_list();
+        assert_eq!(fsl.len(), 2);
+        assert_eq!(fsl.value_type(), DataType::UInt8);
+    }
+
+    #[test]
+    fn test_large_list_to_fsl_f64() {
+        let mut builder = LargeListBuilder::new(Float64Builder::new());
+        for vals in &[vec![1.0_f64, 2.0], vec![3.0, 4.0]] {
+            for v in vals {
+                builder.values().append_value(*v);
+            }
+            builder.append(true);
+        }
+        let arr: ArrayRef = Arc::new(builder.finish());
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vec",
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Float64, true))),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+
+        let expr = CastToFixedSizeListExpr::new(source_col(), 2, DataType::Float64);
+        let result = eval_expr(&expr, &batch);
+        let fsl = result.as_fixed_size_list();
+        assert_eq!(fsl.len(), 2);
+        assert_eq!(fsl.value_type(), DataType::Float64);
+    }
+
+    #[test]
+    fn test_try_new_from_target_preserves_inner_field() {
+        let inner = Arc::new(Field::new("values", DataType::Float64, false));
+        let target = DataType::FixedSizeList(inner.clone(), 4);
+        let expr =
+            CastToFixedSizeListExpr::try_new_from_target_type(source_col(), &target).unwrap();
+        let schema = Schema::new(vec![Field::new(
+            "vec",
+            DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+            true,
+        )]);
+        let dt = expr.data_type(&schema).unwrap();
+        match dt {
+            DataType::FixedSizeList(field, dim) => {
+                assert_eq!(dim, 4);
+                assert_eq!(field.name(), "values");
+                assert_eq!(field.data_type(), &DataType::Float64);
+                assert!(!field.is_nullable());
+            }
+            _ => panic!("expected FixedSizeList"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_schema_cast_projection_nullability_diff() {
+        // Source has nullable=true, target has nullable=false for a column.
+        // schemas_equal should detect this and create a projection.
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Float32, true),
+        ]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Float32, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int32Array::from(vec![1, 2])),
+                Arc::new(Float32Array::from(vec![1.0, 2.0])),
+            ],
+        )
+        .unwrap();
+
+        let mem_table = MemTable::try_new(source_schema, vec![vec![batch]]).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(mem_table)).unwrap();
+        let df = ctx.sql("SELECT * FROM t").await.unwrap();
+        let input = df.create_physical_plan().await.unwrap();
+
+        let result = create_schema_cast_projection(input.clone(), &target_schema).unwrap();
+        // Should NOT return the same input since nullability differs
+        assert!(!Arc::ptr_eq(&result, &input));
     }
 
     #[tokio::test]
