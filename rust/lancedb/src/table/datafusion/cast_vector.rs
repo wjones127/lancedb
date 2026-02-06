@@ -100,8 +100,21 @@ impl CastToFixedSizeListExpr {
             )));
         }
         let values = fsl.values();
-        if *values.data_type() == *self.inner_type() {
+        let DataType::FixedSizeList(source_field, _) = fsl.data_type() else {
+            unreachable!()
+        };
+        if source_field == &self.inner_field {
             return Ok(Arc::new(fsl.clone()));
+        }
+        if *values.data_type() == *self.inner_type() {
+            // Types match but field name/nullability differs — rebuild with target field
+            let new_fsl = FixedSizeListArray::new(
+                self.inner_field.clone(),
+                self.dimension,
+                values.clone(),
+                fsl.nulls().cloned(),
+            );
+            return Ok(Arc::new(new_fsl));
         }
         let cast_values = cast(values, self.inner_type())?;
         let new_fsl = FixedSizeListArray::new(
@@ -178,8 +191,8 @@ impl PhysicalExpr for CastToFixedSizeListExpr {
                         )
                         .map_err(|e| datafusion_common::DataFusionError::External(e.into()))?
                     }
-                    _ => {
-                        // Fallback: build as Float32, then cast inner values to target type
+                    DataType::Float16 => {
+                        // Float16 is a subset of Float32, so build via Float32 then cast
                         let f32_values = cast(&flat_values, &DataType::Float32)?;
                         let typed = f32_values.as_primitive::<arrow_array::types::Float32Type>();
                         let fsl = build_fsl_from_offsets::<arrow_array::builder::Float32Builder>(
@@ -190,10 +203,15 @@ impl PhysicalExpr for CastToFixedSizeListExpr {
                             &BadVectorStrategy::Null,
                         )
                         .map_err(|e| datafusion_common::DataFusionError::External(e.into()))?;
-                        // Cast the FSL to the target inner type
                         let target_dt =
                             DataType::FixedSizeList(self.inner_field.clone(), self.dimension);
                         cast(&fsl, &target_dt)?
+                    }
+                    _ => {
+                        return Err(datafusion_common::DataFusionError::Execution(format!(
+                            "CastToFixedSizeListExpr: unsupported target inner type {:?}",
+                            inner_type
+                        )));
                     }
                 }
             }
@@ -248,6 +266,9 @@ impl PhysicalExpr for CastToFixedSizeListExpr {
     }
 }
 
+/// Compares schemas by field name, data type, and nullability. Metadata is
+/// intentionally excluded because projections cannot change field metadata —
+/// the output schema comes from the expressions, not the target.
 fn schemas_equal(a: &Schema, b: &Schema) -> bool {
     if a.fields().len() != b.fields().len() {
         return false;
@@ -791,5 +812,107 @@ mod tests {
         assert_eq!(vals.value(0), 1.0);
         assert_eq!(vals.value(1), 2.0);
         assert_eq!(vals.value(2), 3.0);
+    }
+
+    #[test]
+    fn test_fsl_to_fsl_different_field_name() {
+        // Source FSL has inner field "item", target has "values" — should rebuild
+        let source_inner = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vec",
+            DataType::FixedSizeList(source_inner, 2),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![{
+                let mut builder = FixedSizeListBuilder::new(Float32Builder::with_capacity(4), 2);
+                for vals in &[vec![1.0_f32, 2.0], vec![3.0, 4.0]] {
+                    for v in vals {
+                        builder.values().append_value(*v);
+                    }
+                    builder.append(true);
+                }
+                Arc::new(builder.finish()) as ArrayRef
+            }],
+        )
+        .unwrap();
+
+        let target_inner = Arc::new(Field::new("values", DataType::Float32, true));
+        let target = DataType::FixedSizeList(target_inner, 2);
+        let expr =
+            CastToFixedSizeListExpr::try_new_from_target_type(source_col(), &target).unwrap();
+        let result = eval_expr(&expr, &batch);
+        let fsl = result.as_fixed_size_list();
+        assert_eq!(fsl.len(), 2);
+        // Inner field name should now be "values"
+        match fsl.data_type() {
+            DataType::FixedSizeList(field, _) => assert_eq!(field.name(), "values"),
+            _ => panic!("expected FSL"),
+        }
+        let row0 = fsl.value(0);
+        let vals = row0.as_primitive::<Float32Type>();
+        assert_eq!(vals.value(0), 1.0);
+    }
+
+    #[test]
+    fn test_fsl_to_fsl_different_nullability() {
+        // Source FSL inner is nullable=true, target is nullable=false — should rebuild
+        let source_inner = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vec",
+            DataType::FixedSizeList(source_inner, 2),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![{
+                let mut builder = FixedSizeListBuilder::new(Float32Builder::with_capacity(4), 2);
+                for vals in &[vec![1.0_f32, 2.0], vec![3.0, 4.0]] {
+                    for v in vals {
+                        builder.values().append_value(*v);
+                    }
+                    builder.append(true);
+                }
+                Arc::new(builder.finish()) as ArrayRef
+            }],
+        )
+        .unwrap();
+
+        let target_inner = Arc::new(Field::new("item", DataType::Float32, false));
+        let target = DataType::FixedSizeList(target_inner, 2);
+        let expr =
+            CastToFixedSizeListExpr::try_new_from_target_type(source_col(), &target).unwrap();
+        let result = eval_expr(&expr, &batch);
+        let fsl = result.as_fixed_size_list();
+        match fsl.data_type() {
+            DataType::FixedSizeList(field, _) => assert!(!field.is_nullable()),
+            _ => panic!("expected FSL"),
+        }
+    }
+
+    #[test]
+    fn test_unsupported_target_type_errors() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vec",
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![make_list_f32(&[Some(vec![1.0, 2.0]), Some(vec![3.0, 4.0])])],
+        )
+        .unwrap();
+
+        // Int64 is not a supported vector inner type
+        let expr = CastToFixedSizeListExpr::new(source_col(), 2, DataType::Int64);
+        let result = expr.evaluate(&batch);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported target inner type"),
+            "error should mention unsupported type: {}",
+            err
+        );
     }
 }

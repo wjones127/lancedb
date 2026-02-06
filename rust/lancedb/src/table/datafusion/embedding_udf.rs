@@ -126,6 +126,18 @@ impl PhysicalExpr for EmbeddingPhysicalExpr {
     }
 }
 
+/// Compares two [`DataType`]s for compatibility, treating FSLs as equal if they
+/// have the same dimension and inner data type regardless of inner field name
+/// or nullability.
+fn fsl_compatible(a: &DataType, b: &DataType) -> bool {
+    match (a, b) {
+        (DataType::FixedSizeList(a_inner, a_dim), DataType::FixedSizeList(b_inner, b_dim)) => {
+            a_dim == b_dim && a_inner.data_type() == b_inner.data_type()
+        }
+        _ => a == b,
+    }
+}
+
 /// Builds a [`ProjectionExec`] that appends embedding columns to the input.
 ///
 /// For each embedding definition, creates an [`EmbeddingPhysicalExpr`] that
@@ -174,20 +186,16 @@ pub fn build_embedding_projection(
                 .dest_type()
                 .map_err(|e| DataFusionError::External(e.into()))?
                 .into_owned();
-            // Normalize FSL nullability for comparison (DataFusion normalizes to nullable)
-            let normalized_expected = match &expected_type {
-                DataType::FixedSizeList(inner, dim) => DataType::FixedSizeList(
-                    Arc::new(Field::new(inner.name(), inner.data_type().clone(), true)),
-                    *dim,
-                ),
-                other => other.clone(),
-            };
-            if *existing_field.data_type() != normalized_expected {
+            // Compare FSLs by dimension + inner data type only. Inner field names
+            // vary between schemas (e.g. "item" vs "values") and DataFusion
+            // normalizes inner fields to nullable, so neither name nor nullability
+            // should cause a mismatch.
+            if !fsl_compatible(existing_field.data_type(), &expected_type) {
                 return Err(DataFusionError::Plan(format!(
                     "existing column '{}' has type {:?}, but embedding function produces {:?}",
                     dest_name,
                     existing_field.data_type(),
-                    normalized_expected,
+                    expected_type,
                 )));
             }
             continue;
@@ -399,5 +407,43 @@ mod tests {
         let batches = collect(result_plan, ctx.task_ctx()).await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].schema().field(1).name(), "text_embedding");
+    }
+
+    #[tokio::test]
+    async fn test_build_projection_skips_existing_different_field_name() {
+        // Existing column has inner field "values" but embedding produces "item" —
+        // should still be considered compatible and skip.
+        let fsl_type =
+            DataType::FixedSizeList(Arc::new(Field::new("values", DataType::Float32, true)), 4);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("text", DataType::Utf8, false),
+            Field::new("text_vec", fsl_type, true),
+        ]));
+
+        let inner_field = Arc::new(Field::new("values", DataType::Float32, true));
+        let values = Arc::new(arrow_array::Float32Array::from(vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+        ]));
+        let fsl = arrow_array::FixedSizeListArray::new(inner_field, 4, values as ArrayRef, None);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["hello", "world"])),
+                Arc::new(fsl) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let mock: Arc<dyn EmbeddingFunction> = Arc::new(MockEmbed::new("test", 4));
+        let def = EmbeddingDefinition::new("text", "test", Some("text_vec"));
+
+        let mem_table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(mem_table)).unwrap();
+        let df = ctx.sql("SELECT * FROM t").await.unwrap();
+        let input = df.create_physical_plan().await.unwrap();
+
+        let result_plan = build_embedding_projection(input.clone(), &[(def, mock)]).unwrap();
+        assert!(Arc::ptr_eq(&result_plan, &input));
     }
 }
