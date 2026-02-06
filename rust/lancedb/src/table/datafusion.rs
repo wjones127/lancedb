@@ -6,7 +6,9 @@
 pub mod cast_vector;
 pub mod embedding_udf;
 pub mod insert;
+pub mod pipeline;
 pub mod preprocessing;
+pub mod scannable_exec;
 pub mod udtf;
 
 use std::{collections::HashMap, sync::Arc};

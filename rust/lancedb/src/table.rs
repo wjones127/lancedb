@@ -55,7 +55,7 @@ use std::format;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::data::scannable::{MaybeEmbeddedScannable, Scannable};
+use crate::data::scannable::Scannable;
 use crate::database::Database;
 use crate::embeddings::{EmbeddingDefinition, EmbeddingRegistry, MemoryRegistry};
 use crate::error::{Error, Result};
@@ -2719,6 +2719,8 @@ impl BaseTable for NativeTable {
     }
 
     async fn add(&self, add: AddDataBuilder) -> Result<AddResult> {
+        self.dataset.ensure_mutable().await?;
+
         let lance_params = add.write_options.lance_write_params.unwrap_or(WriteParams {
             mode: match add.mode {
                 AddDataMode::Append => WriteMode::Append,
@@ -2727,24 +2729,46 @@ impl BaseTable for NativeTable {
             ..Default::default()
         });
 
-        // Apply embeddings if configured
-        let table_def = self.table_definition().await?;
-        let data: Box<dyn Scannable> = Box::new(MaybeEmbeddedScannable::try_new(
-            add.data,
-            &table_def,
-            add.embedding_registry.as_ref(),
-        )?);
+        // Build source plan from Scannable
+        let source: Arc<dyn ExecutionPlan> =
+            Arc::new(datafusion::scannable_exec::ScannableExec::new(add.data));
 
-        let dataset = {
-            // Limited scope for the mutable borrow of self.dataset avoids deadlock.
-            let ds = self.dataset.get_mut().await?;
-            InsertBuilder::new(Arc::new(ds.clone()))
-                .with_params(&lance_params)
-                .execute_stream(data)
-                .await?
+        // Determine effective mode (lance_write_params may override AddDataMode)
+        let effective_mode = if matches!(lance_params.mode, WriteMode::Overwrite) {
+            AddDataMode::Overwrite
+        } else {
+            add.mode
         };
-        let version = dataset.manifest().version;
-        self.dataset.set_latest(dataset).await;
+
+        // Add embedding projection + schema cast
+        let plan = datafusion::pipeline::build_processing_pipeline(
+            source,
+            self,
+            add.embedding_registry.as_ref(),
+            &effective_mode,
+        )
+        .await?;
+
+        // Add insert exec
+        let ds = self.dataset.get().await?;
+        let dataset = Arc::new((*ds).clone());
+        drop(ds);
+        let insert = Arc::new(datafusion::insert::InsertExec::new(
+            self.dataset.clone(),
+            dataset,
+            plan,
+            lance_params,
+        ));
+
+        // Execute
+        let ctx = ::datafusion::prelude::SessionContext::new();
+        datafusion_physical_plan::collect(insert, ctx.task_ctx())
+            .await
+            .map_err(|e| Error::Runtime {
+                message: e.to_string(),
+            })?;
+
+        let version = self.dataset.get().await?.manifest().version;
         Ok(AddResult { version })
     }
 

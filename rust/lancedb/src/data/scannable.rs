@@ -24,6 +24,7 @@ use crate::embeddings::{
     compute_embeddings_for_batch, compute_output_schema, EmbeddingDefinition, EmbeddingFunction,
     EmbeddingRegistry,
 };
+use crate::table::datafusion::pipeline::resolve_embeddings;
 use crate::table::{ColumnDefinition, ColumnKind, TableDefinition};
 use crate::{Error, Result};
 
@@ -299,26 +300,7 @@ impl MaybeEmbeddedScannable {
         registry: Option<&Arc<dyn EmbeddingRegistry>>,
     ) -> Result<Self> {
         if let Some(registry) = registry {
-            let mut embeddings = Vec::with_capacity(table_definition.column_definitions.len());
-            for cd in table_definition.column_definitions.iter() {
-                if let ColumnKind::Embedding(embedding_def) = &cd.kind {
-                    match registry.get(&embedding_def.embedding_name) {
-                        Some(func) => {
-                            embeddings.push((embedding_def.clone(), func));
-                        }
-                        None => {
-                            return Err(Error::EmbeddingFunctionNotFound {
-                                name: embedding_def.embedding_name.clone(),
-                                reason: format!(
-                                    "Table was defined with an embedding column `{}` but no embedding function was found with that name within the registry.",
-                                    embedding_def.embedding_name
-                                ),
-                            });
-                        }
-                    }
-                }
-            }
-
+            let embeddings = resolve_embeddings(table_definition, registry.as_ref())?;
             if !embeddings.is_empty() {
                 return Ok(Self::Yes(WithEmbeddingsScannable::try_new(
                     inner, embeddings,

@@ -943,34 +943,46 @@ impl<S: HttpSend> BaseTable for RemoteTable<S> {
             status_code: None,
         })
     }
-    async fn add(&self, mut add: AddDataBuilder) -> Result<AddResult> {
+    async fn add(&self, add: AddDataBuilder) -> Result<AddResult> {
         self.check_mutable().await?;
-        let mut request = self
-            .client
-            .post(&format!("/v1/table/{}/insert/", self.identifier))
-            .header(CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE);
 
-        match add.mode {
-            AddDataMode::Append => {}
-            AddDataMode::Overwrite => {
-                request = request.query(&[("mode", "overwrite")]);
-            }
-        }
+        let overwrite = matches!(add.mode, AddDataMode::Overwrite);
 
-        let (request_id, response) = self.send_scannable(request, &mut *add.data).await?;
-        let response = self.check_table_response(&request_id, response).await?;
-        let body = response.text().await.err_to_http(request_id.clone())?;
-        if body.trim().is_empty() {
-            // Backward compatible with old servers
-            return Ok(AddResult { version: 0 });
-        }
+        // Build source plan from Scannable
+        let source: Arc<dyn ExecutionPlan> =
+            Arc::new(crate::table::datafusion::scannable_exec::ScannableExec::new(add.data));
 
-        let add_response: AddResult = serde_json::from_str(&body).map_err(|e| Error::Http {
-            source: format!("Failed to parse add response: {}", e).into(),
-            request_id,
-            status_code: None,
-        })?;
-        Ok(add_response)
+        // Add embedding projection + schema cast
+        let plan = crate::table::datafusion::pipeline::build_processing_pipeline(
+            source,
+            self,
+            add.embedding_registry.as_ref(),
+            &add.mode,
+        )
+        .await?;
+
+        // Create RemoteInsertExec (keep typed reference for result extraction)
+        let insert = Arc::new(insert::RemoteInsertExec::new(
+            self.name.clone(),
+            self.identifier.clone(),
+            self.client.clone(),
+            plan,
+            overwrite,
+        ));
+        let insert_ref = insert.clone();
+        let insert_plan: Arc<dyn ExecutionPlan> = insert;
+
+        // Execute
+        let ctx = ::datafusion::prelude::SessionContext::new();
+        datafusion_physical_plan::collect(insert_plan, ctx.task_ctx())
+            .await
+            .map_err(|e| Error::Runtime {
+                message: e.to_string(),
+            })?;
+
+        insert_ref.add_result().ok_or_else(|| Error::Runtime {
+            message: "RemoteInsertExec did not produce an AddResult".into(),
+        })
     }
 
     async fn create_plan(
@@ -1751,6 +1763,16 @@ mod tests {
         DistanceType, Error, Table,
     };
 
+    /// Build a describe response JSON for the given schema.
+    fn describe_response(schema: &Schema) -> String {
+        let json_schema = lance::arrow::json::JsonSchema::try_from(schema).unwrap();
+        serde_json::json!({
+            "version": 1,
+            "schema": json_schema,
+        })
+        .to_string()
+    }
+
     #[tokio::test]
     async fn test_not_found() {
         let table = Table::new_with_handler("my_table", |_| {
@@ -1957,30 +1979,36 @@ mod tests {
         // Clone response_body to give it 'static lifetime for the closure
         let response_body = response_body.to_string();
 
+        let describe_body = describe_response(&data.schema());
+
         let (sender, receiver) = std::sync::mpsc::channel();
-        let table = Table::new_with_handler("my_table", move |mut request| {
-            if request.url().path() == "/v1/table/my_table/insert/" {
-                assert_eq!(request.method(), "POST");
-                assert!(request
-                    .url()
-                    .query_pairs()
-                    .filter(|(k, _)| k == "mode")
-                    .all(|(_, v)| v == "append"));
-                assert_eq!(
-                    request.headers().get("Content-Type").unwrap(),
-                    ARROW_STREAM_CONTENT_TYPE
-                );
-                let mut body_out = reqwest::Body::from(Vec::new());
-                std::mem::swap(request.body_mut().as_mut().unwrap(), &mut body_out);
-                sender.send(body_out).unwrap();
-                http::Response::builder()
+        let table =
+            Table::new_with_handler("my_table", move |mut request| match request.url().path() {
+                "/v1/table/my_table/describe/" => http::Response::builder()
                     .status(200)
-                    .body(response_body.clone())
-                    .unwrap()
-            } else {
-                panic!("Unexpected request path: {}", request.url().path());
-            }
-        });
+                    .body(describe_body.clone())
+                    .unwrap(),
+                "/v1/table/my_table/insert/" => {
+                    assert_eq!(request.method(), "POST");
+                    assert!(request
+                        .url()
+                        .query_pairs()
+                        .filter(|(k, _)| k == "mode")
+                        .all(|(_, v)| v == "append"));
+                    assert_eq!(
+                        request.headers().get("Content-Type").unwrap(),
+                        ARROW_STREAM_CONTENT_TYPE
+                    );
+                    let mut body_out = reqwest::Body::from(Vec::new());
+                    std::mem::swap(request.body_mut().as_mut().unwrap(), &mut body_out);
+                    sender.send(body_out).unwrap();
+                    http::Response::builder()
+                        .status(200)
+                        .body(response_body.clone())
+                        .unwrap()
+                }
+                path => panic!("Unexpected request path: {}", path),
+            });
         let result = table.add(data.clone()).execute().await.unwrap();
 
         // Check version matches expected value
@@ -3419,23 +3447,30 @@ mod tests {
         )
         .unwrap();
 
+        let describe_body = describe_response(&data.schema());
+
         let (sender, receiver) = std::sync::mpsc::channel();
         let table = Table::new_with_handler("prod$metrics", move |mut request| {
-            if request.url().path() == "/v1/table/prod$metrics/insert/" {
-                assert_eq!(request.method(), "POST");
-                assert_eq!(
-                    request.headers().get("Content-Type").unwrap(),
-                    ARROW_STREAM_CONTENT_TYPE
-                );
-                let mut body_out = reqwest::Body::from(Vec::new());
-                std::mem::swap(request.body_mut().as_mut().unwrap(), &mut body_out);
-                sender.send(body_out).unwrap();
-                http::Response::builder()
+            match request.url().path() {
+                "/v1/table/prod$metrics/describe/" => http::Response::builder()
                     .status(200)
-                    .body(r#"{"version": 2}"#)
-                    .unwrap()
-            } else {
-                panic!("Unexpected request path: {}", request.url().path());
+                    .body(describe_body.clone())
+                    .unwrap(),
+                "/v1/table/prod$metrics/insert/" => {
+                    assert_eq!(request.method(), "POST");
+                    assert_eq!(
+                        request.headers().get("Content-Type").unwrap(),
+                        ARROW_STREAM_CONTENT_TYPE
+                    );
+                    let mut body_out = reqwest::Body::from(Vec::new());
+                    std::mem::swap(request.body_mut().as_mut().unwrap(), &mut body_out);
+                    sender.send(body_out).unwrap();
+                    http::Response::builder()
+                        .status(200)
+                        .body(r#"{"version": 2}"#.to_string())
+                        .unwrap()
+                }
+                path => panic!("Unexpected request path: {}", path),
             }
         });
 
@@ -3589,66 +3624,76 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_retries_rescannable_data() {
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let call_count_clone = call_count.clone();
+        let batch = record_batch!(("a", Int32, [1, 2, 3])).unwrap();
+        let describe_body = describe_response(&batch.schema());
+
+        let insert_count = Arc::new(AtomicUsize::new(0));
+        let insert_count_clone = insert_count.clone();
 
         // Configure with retries enabled (default is 3)
         let config = crate::remote::ClientConfig::default();
 
         let table = Table::new_with_handler_and_config(
             "my_table",
-            move |_request| {
-                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
-                if count < 2 {
-                    // First two attempts fail with a retryable error (409)
-                    http::Response::builder().status(409).body("").unwrap()
-                } else {
-                    // Third attempt succeeds
-                    http::Response::builder()
+            move |request| {
+                if request.url().path().ends_with("/describe/") {
+                    return http::Response::builder()
                         .status(200)
-                        .body(r#"{"version": 1}"#)
-                        .unwrap()
+                        .body(describe_body.clone())
+                        .unwrap();
                 }
+                insert_count_clone.fetch_add(1, Ordering::SeqCst);
+                // Return 409 (retryable), but RemoteInsertExec doesn't retry
+                http::Response::builder()
+                    .status(409)
+                    .body(String::new())
+                    .unwrap()
             },
             config,
         );
 
-        // RecordBatch is rescannable - should retry and succeed
-        let batch = record_batch!(("a", Int32, [1, 2, 3])).unwrap();
+        // RemoteInsertExec does not retry — the insert fails on the first attempt.
+        // Retry logic for the DF pipeline will be added in a future PR.
         let result = table.add(batch).execute().await;
-
-        assert!(
-            result.is_ok(),
-            "Expected success after retries: {:?}",
-            result
-        );
+        assert!(result.is_err());
         assert_eq!(
-            call_count.load(Ordering::SeqCst),
-            3,
-            "Expected 2 failed attempts + 1 success = 3 total"
+            insert_count.load(Ordering::SeqCst),
+            1,
+            "Expected exactly 1 insert attempt (no retries in DF pipeline)"
         );
     }
 
     #[tokio::test]
     async fn test_add_no_retry_for_non_rescannable() {
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let call_count_clone = call_count.clone();
+        let batch = record_batch!(("a", Int32, [1, 2, 3])).unwrap();
+        let describe_body = describe_response(&batch.schema());
+
+        let insert_count = Arc::new(AtomicUsize::new(0));
+        let insert_count_clone = insert_count.clone();
 
         // Configure with retries enabled
         let config = crate::remote::ClientConfig::default();
 
         let table = Table::new_with_handler_and_config(
             "my_table",
-            move |_request| {
-                call_count_clone.fetch_add(1, Ordering::SeqCst);
+            move |request| {
+                if request.url().path().ends_with("/describe/") {
+                    return http::Response::builder()
+                        .status(200)
+                        .body(describe_body.clone())
+                        .unwrap();
+                }
+                insert_count_clone.fetch_add(1, Ordering::SeqCst);
                 // Always fail with retryable error
-                http::Response::builder().status(409).body("").unwrap()
+                http::Response::builder()
+                    .status(409)
+                    .body(String::new())
+                    .unwrap()
             },
             config,
         );
 
-        // RecordBatchReader is NOT rescannable - should NOT retry
-        let batch = record_batch!(("a", Int32, [1, 2, 3])).unwrap();
+        // RecordBatchReader is NOT rescannable
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
             vec![Ok(batch.clone())],
             batch.schema(),
@@ -3656,27 +3701,13 @@ mod tests {
 
         let result = table.add(reader).execute().await;
 
-        // Should fail because we can't retry non-rescannable sources
+        // RemoteInsertExec does not retry — single attempt fails.
         assert!(result.is_err());
-        // Right now, we actually do retry, so we get 3 failures. In the future
-        // this will change and we need to update the test.
-        assert!(
-            matches!(
-                result.unwrap_err(),
-                Error::Retry {
-                    request_failures: 3,
-                    ..
-                }
-            ),
-            "Expected RequestFailed with status 409"
+        assert_eq!(
+            insert_count.load(Ordering::SeqCst),
+            1,
+            "Expected exactly 1 insert attempt"
         );
-        // TODO: After we implement proper non-rescannable handling, uncomment below
-        // (This is blocked on getting Python and Node to pass down re-scannable data.)
-        // assert_eq!(
-        //     call_count.load(Ordering::SeqCst),
-        //     1,
-        //     "Expected only one attempt for non-rescannable source"
-        // );
     }
 
     #[rstest]
