@@ -225,7 +225,7 @@ impl WithEmbeddingsScannable {
             }))
             .collect();
 
-        let table_definition = TableDefinition::new(output_schema, column_definitions);
+        let table_definition = TableDefinition::new(output_schema, column_definitions)?;
         let rich_schema = table_definition.clone().into_rich_schema();
 
         Ok(Self {
@@ -609,7 +609,8 @@ mod tests {
                         kind: ColumnKind::Embedding(embedding_def.clone()),
                     },
                 ],
-            );
+            )
+            .unwrap();
 
             // Register the mock embedding function
             let registry: Arc<dyn EmbeddingRegistry> = Arc::new(MemoryRegistry::new());
@@ -666,7 +667,8 @@ mod tests {
                         kind: ColumnKind::Embedding(embedding_def),
                     },
                 ],
-            );
+            )
+            .unwrap();
 
             // Registry has no embedding functions registered
             let registry: Arc<dyn EmbeddingRegistry> = Arc::new(MemoryRegistry::new());

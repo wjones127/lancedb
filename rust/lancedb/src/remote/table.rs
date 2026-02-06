@@ -3678,4 +3678,34 @@ mod tests {
         //     "Expected only one attempt for non-rescannable source"
         // );
     }
+
+    #[rstest]
+    #[case(f32::NAN)]
+    #[case(f32::INFINITY)]
+    #[case(f32::NEG_INFINITY)]
+    #[tokio::test]
+    async fn test_vector_query_rejects_non_finite_floats(#[case] bad_value: f32) {
+        let table = Table::new_with_handler("my_table", |_request| -> http::Response<String> {
+            panic!("should not reach the server");
+        });
+
+        let result = table
+            .query()
+            .nearest_to(vec![bad_value, 0.2, 0.3])
+            .unwrap()
+            .execute()
+            .await;
+
+        match result {
+            Err(Error::InvalidInput { message }) => {
+                assert!(
+                    message.contains("non-finite"),
+                    "Expected non-finite error message, got: {}",
+                    message
+                );
+            }
+            Err(other) => panic!("Expected InvalidInput error, got: {:?}", other),
+            Ok(_) => panic!("Expected error for non-finite float value"),
+        }
+    }
 }

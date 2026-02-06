@@ -117,18 +117,20 @@ pub struct TableDefinition {
 }
 
 impl TableDefinition {
-    pub fn new(schema: SchemaRef, column_definitions: Vec<ColumnDefinition>) -> Self {
-        assert_eq!(
-            column_definitions.len(),
-            schema.fields().len(),
-            "column_definitions length ({}) must match schema fields length ({})",
-            column_definitions.len(),
-            schema.fields().len(),
-        );
-        Self {
+    pub fn new(schema: SchemaRef, column_definitions: Vec<ColumnDefinition>) -> Result<Self> {
+        if column_definitions.len() != schema.fields().len() {
+            return Err(Error::InvalidInput {
+                message: format!(
+                    "column_definitions length ({}) must match schema fields length ({})",
+                    column_definitions.len(),
+                    schema.fields().len(),
+                ),
+            });
+        }
+        Ok(Self {
             column_definitions,
             schema,
-        }
+        })
     }
 
     pub fn new_from_schema(schema: SchemaRef) -> Self {
@@ -139,7 +141,8 @@ impl TableDefinition {
                 kind: ColumnKind::Physical,
             })
             .collect();
-        Self::new(schema, column_definitions)
+        // Length is guaranteed to match since we derive from the schema itself.
+        Self::new(schema, column_definitions).unwrap()
     }
 
     pub fn try_from_rich_schema(schema: SchemaRef) -> Result<Self> {
@@ -149,16 +152,9 @@ impl TableDefinition {
                 serde_json::from_str(column_definitions).map_err(|e| Error::Runtime {
                     message: format!("Failed to deserialize column definitions: {}", e),
                 })?;
-            Ok(Self::new(schema, column_definitions))
+            Self::new(schema, column_definitions)
         } else {
-            let column_definitions = schema
-                .fields()
-                .iter()
-                .map(|_| ColumnDefinition {
-                    kind: ColumnKind::Physical,
-                })
-                .collect();
-            Ok(Self::new(schema, column_definitions))
+            Ok(Self::new_from_schema(schema))
         }
     }
 

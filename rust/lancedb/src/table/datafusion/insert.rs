@@ -175,6 +175,10 @@ impl ExecutionPlan for InsertExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        if partition == 0 {
+            self.any_partition_failed.store(false, Ordering::SeqCst);
+            self.partial_transactions.lock().unwrap().clear();
+        }
         let input_stream = self.input.execute(partition, context)?;
         let dataset = self.dataset.clone();
         let write_params = self.write_params.clone();
@@ -248,6 +252,86 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::connect;
+
+    /// An ExecutionPlan that wraps another plan but injects an error into one partition's stream.
+    #[derive(Debug)]
+    struct ErrorInjectingExec {
+        input: Arc<dyn ExecutionPlan>,
+        /// Which partition should produce an error.
+        error_partition: usize,
+        properties: PlanProperties,
+    }
+
+    impl ErrorInjectingExec {
+        fn new(input: Arc<dyn ExecutionPlan>, error_partition: usize) -> Self {
+            let properties = input.properties().clone();
+            Self {
+                input,
+                error_partition,
+                properties,
+            }
+        }
+    }
+
+    impl DisplayAs for ErrorInjectingExec {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            write!(f, "ErrorInjectingExec")
+        }
+    }
+
+    impl ExecutionPlan for ErrorInjectingExec {
+        fn name(&self) -> &str {
+            "ErrorInjectingExec"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.input.schema()
+        }
+
+        fn properties(&self) -> &PlanProperties {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.input]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self::new(
+                children[0].clone(),
+                self.error_partition,
+            )))
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            if partition == self.error_partition {
+                let schema = self.schema();
+                let stream = futures::stream::once(async {
+                    Err(DataFusionError::Execution(
+                        "injected partition error".to_string(),
+                    ))
+                });
+                Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+            } else {
+                self.input.execute(partition, context)
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_insert_via_sql() {
@@ -438,5 +522,69 @@ mod tests {
         // Verify: should have 1 + 2 + 2 + 3 = 8 rows
         table.checkout_latest().await.unwrap();
         assert_eq!(table.count_rows(None).await.unwrap(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_insert_no_commit_on_partition_failure() {
+        use datafusion_catalog::TableProvider;
+
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let db = connect(uri).execute().await.unwrap();
+
+        let batch = record_batch!(("id", Int32, [1])).unwrap();
+        let schema = batch.schema();
+
+        let table = db
+            .create_table("test_partition_fail", batch)
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(table.count_rows(None).await.unwrap(), 1);
+
+        let ctx = SessionContext::new();
+
+        // Create a source with 2 partitions, where partition 1 will error.
+        let good_data = MemTable::try_new(
+            schema.clone(),
+            vec![
+                vec![record_batch!(("id", Int32, [2, 3])).unwrap()],
+                vec![record_batch!(("id", Int32, [4, 5])).unwrap()],
+            ],
+        )
+        .unwrap();
+        let good_plan = good_data.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        // Wrap in ErrorInjectingExec to make partition 1 fail.
+        let error_plan: Arc<dyn ExecutionPlan> = Arc::new(ErrorInjectingExec::new(good_plan, 1));
+
+        // Build InsertExec directly.
+        let ds_wrapper = table.dataset().unwrap().clone();
+        let ds = ds_wrapper.get().await.unwrap();
+        let dataset = Arc::new((*ds).clone());
+        drop(ds);
+
+        let insert_exec = InsertExec::new(
+            ds_wrapper.clone(),
+            dataset,
+            error_plan,
+            WriteParams::default(),
+        );
+        let insert_plan: Arc<dyn ExecutionPlan> = Arc::new(insert_exec);
+
+        let task_ctx = ctx.task_ctx();
+        let results = datafusion_physical_plan::collect(insert_plan, task_ctx).await;
+
+        // The insert should fail because one partition errored.
+        assert!(
+            results.is_err(),
+            "Expected insert to fail due to partition error"
+        );
+
+        // The table should still have only 1 row (no commit occurred).
+        table.checkout_latest().await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 1);
     }
 }
