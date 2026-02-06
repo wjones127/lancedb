@@ -3782,4 +3782,65 @@ mod tests {
             .unwrap();
         assert_eq!(result.version, 2);
     }
+
+    #[tokio::test]
+    async fn test_add_with_progress_end_to_end() {
+        use crate::table::add_data::WriteProgress;
+        use std::sync::Mutex;
+
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let describe_body = describe_response(&data.schema());
+
+        // Capture the request body so we can consume the lazy IPC stream after
+        // execute() returns — that is what triggers progress callbacks.
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Body>(1);
+        let table =
+            Table::new_with_handler("my_table", move |mut request| match request.url().path() {
+                "/v1/table/my_table/describe/" => http::Response::builder()
+                    .status(200)
+                    .body(describe_body.clone())
+                    .unwrap(),
+                "/v1/table/my_table/insert/" => {
+                    let mut body_out = Body::from(Vec::new());
+                    std::mem::swap(request.body_mut().as_mut().unwrap(), &mut body_out);
+                    sender.try_send(body_out).unwrap();
+                    http::Response::builder()
+                        .status(200)
+                        .body(r#"{"version": 2}"#.to_string())
+                        .unwrap()
+                }
+                path => panic!("Unexpected request path: {}", path),
+            });
+
+        let updates: Arc<Mutex<Vec<WriteProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let updates_clone = updates.clone();
+
+        table
+            .add(data)
+            .progress(move |p| {
+                updates_clone.lock().unwrap().push(p);
+            })
+            .execute()
+            .await
+            .unwrap();
+
+        // Consume the captured body to drive the IPC stream and fire progress.
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("insert request was not issued within 5s")
+            .expect("body channel closed without sending");
+        let body_bytes = collect_body(body).await;
+        assert!(!body_bytes.is_empty(), "IPC body should be non-empty");
+
+        let updates = updates.lock().unwrap();
+        assert!(!updates.is_empty(), "should have received progress updates");
+        let last = updates.last().unwrap();
+        assert_eq!(last.rows_written, 3);
+        assert!(last.bytes_written > 0);
+    }
 }
