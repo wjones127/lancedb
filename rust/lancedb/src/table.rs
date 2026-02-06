@@ -131,6 +131,11 @@ impl TableDefinition {
         }
     }
 
+    /// Creates a [`TableDefinition`] with validation, returning an error if
+    /// `column_definitions.len()` does not match `schema.fields().len()`.
+    ///
+    /// Prefer [`TableDefinition::new`] when the caller can guarantee the
+    /// lengths match (e.g. when both are derived from the same source).
     pub fn try_new(schema: SchemaRef, column_definitions: Vec<ColumnDefinition>) -> Result<Self> {
         if column_definitions.len() != schema.fields().len() {
             return Err(Error::InvalidInput {

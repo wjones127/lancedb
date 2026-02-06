@@ -67,6 +67,36 @@ fn merge_transactions(mut transactions: Vec<Transaction>) -> Option<Transaction>
     Some(first)
 }
 
+/// Mutable state shared across partitions within a single execution.
+///
+/// Bundled into a single `Mutex` so that `did_reset` can be cleared once all
+/// partitions (both successful and failed) have reported, allowing subsequent
+/// executions of the same plan to start with fresh state.
+#[derive(Debug)]
+struct InsertExecState {
+    partial_transactions: Vec<Transaction>,
+    any_partition_failed: bool,
+    /// Number of partitions that have finished (success or failure).
+    completed_count: usize,
+}
+
+impl InsertExecState {
+    fn new(num_partitions: usize) -> Self {
+        Self {
+            partial_transactions: Vec::with_capacity(num_partitions),
+            any_partition_failed: false,
+            completed_count: 0,
+        }
+    }
+
+    fn reset(&mut self, num_partitions: usize) {
+        self.partial_transactions.clear();
+        self.partial_transactions.reserve(num_partitions);
+        self.any_partition_failed = false;
+        self.completed_count = 0;
+    }
+}
+
 /// ExecutionPlan for inserting data into a native LanceDB table.
 ///
 /// This plan executes inserts by:
@@ -80,11 +110,11 @@ pub struct InsertExec {
     input: Arc<dyn ExecutionPlan>,
     write_params: WriteParams,
     properties: PlanProperties,
-    partial_transactions: Arc<Mutex<Vec<Transaction>>>,
-    any_partition_failed: Arc<AtomicBool>,
+    exec_state: Arc<Mutex<InsertExecState>>,
     /// Ensures shared state is reset exactly once per execution, regardless of
-    /// which partition calls `execute` first.
-    did_reset: AtomicBool,
+    /// which partition calls `execute` first. Reset back to `false` after all
+    /// partitions complete so subsequent executions start fresh.
+    did_reset: Arc<AtomicBool>,
 }
 
 impl InsertExec {
@@ -109,9 +139,8 @@ impl InsertExec {
             input,
             write_params,
             properties,
-            partial_transactions: Arc::new(Mutex::new(Vec::with_capacity(num_partitions))),
-            any_partition_failed: Arc::new(AtomicBool::new(false)),
-            did_reset: AtomicBool::new(false),
+            exec_state: Arc::new(Mutex::new(InsertExecState::new(num_partitions))),
+            did_reset: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -169,8 +198,8 @@ impl ExecutionPlan for InsertExec {
             children[0].clone(),
             self.write_params.clone(),
         );
-        new.any_partition_failed = self.any_partition_failed.clone();
-        new.partial_transactions = self.partial_transactions.clone();
+        new.exec_state = self.exec_state.clone();
+        new.did_reset = self.did_reset.clone();
         Ok(Arc::new(new))
     }
 
@@ -179,21 +208,20 @@ impl ExecutionPlan for InsertExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        let total_partitions = self.input.output_partitioning().partition_count();
         if self
             .did_reset
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            self.any_partition_failed.store(false, Ordering::SeqCst);
-            self.partial_transactions.lock().unwrap().clear();
+            self.exec_state.lock().unwrap().reset(total_partitions);
         }
         let input_stream = self.input.execute(partition, context)?;
         let dataset = self.dataset.clone();
         let write_params = self.write_params.clone();
-        let partial_transactions = self.partial_transactions.clone();
-        let total_partitions = self.input.output_partitioning().partition_count();
+        let exec_state = self.exec_state.clone();
         let ds_wrapper = self.ds_wrapper.clone();
-        let any_partition_failed = self.any_partition_failed.clone();
+        let did_reset = self.did_reset.clone();
 
         let stream = futures::stream::once(async move {
             let result = InsertBuilder::new(dataset.clone())
@@ -204,7 +232,12 @@ impl ExecutionPlan for InsertExec {
             let transaction = match result {
                 Ok(txn) => txn,
                 Err(e) => {
-                    any_partition_failed.store(true, Ordering::SeqCst);
+                    let mut state = exec_state.lock().unwrap();
+                    state.any_partition_failed = true;
+                    state.completed_count += 1;
+                    if state.completed_count == total_partitions {
+                        did_reset.store(false, Ordering::SeqCst);
+                    }
                     return Err(DataFusionError::External(Box::new(e)));
                 }
             };
@@ -212,18 +245,22 @@ impl ExecutionPlan for InsertExec {
             let num_rows = count_rows_from_operation(&transaction.operation);
 
             let to_commit = {
-                // Don't hold the lock over an await point.
-                let mut txns = partial_transactions.lock().unwrap();
-                txns.push(transaction);
-                if txns.len() == total_partitions {
-                    Some(std::mem::take(&mut *txns))
+                let mut state = exec_state.lock().unwrap();
+                state.partial_transactions.push(transaction);
+                state.completed_count += 1;
+                if state.completed_count == total_partitions {
+                    did_reset.store(false, Ordering::SeqCst);
+                    Some((
+                        std::mem::take(&mut state.partial_transactions),
+                        state.any_partition_failed,
+                    ))
                 } else {
                     None
                 }
             };
 
-            if let Some(transactions) = to_commit {
-                if any_partition_failed.load(Ordering::SeqCst) {
+            if let Some((transactions, any_failed)) = to_commit {
+                if any_failed {
                     return Err(DataFusionError::Execution(
                         "Not committing because another partition failed".to_string(),
                     ));
@@ -594,5 +631,134 @@ mod tests {
         // The table should still have only 1 row (no commit occurred).
         table.checkout_latest().await.unwrap();
         assert_eq!(table.count_rows(None).await.unwrap(), 1);
+    }
+
+    /// Verifies that `did_reset` is properly cleared after a failed execution
+    /// with partition errors, allowing subsequent executions to start fresh.
+    #[tokio::test]
+    async fn test_insert_state_resets_after_failure() {
+        use datafusion_catalog::TableProvider;
+
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let db = connect(uri).execute().await.unwrap();
+
+        let batch = record_batch!(("id", Int32, [1])).unwrap();
+        let schema = batch.schema();
+
+        let table = db
+            .create_table("test_state_reset", batch)
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(table.count_rows(None).await.unwrap(), 1);
+
+        let ctx = SessionContext::new();
+
+        // Execute with 2 partitions where partition 1 fails.
+        let source = MemTable::try_new(
+            schema.clone(),
+            vec![
+                vec![record_batch!(("id", Int32, [2, 3])).unwrap()],
+                vec![record_batch!(("id", Int32, [4, 5])).unwrap()],
+            ],
+        )
+        .unwrap();
+        let source_plan = source.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let error_input: Arc<dyn ExecutionPlan> = Arc::new(ErrorInjectingExec::new(source_plan, 1));
+
+        let ds_wrapper = table.dataset().unwrap().clone();
+        let ds = ds_wrapper.get().await.unwrap();
+        let dataset = Arc::new((*ds).clone());
+        drop(ds);
+
+        let insert_exec = InsertExec::new(
+            ds_wrapper.clone(),
+            dataset,
+            error_input,
+            WriteParams::default(),
+        );
+        let insert_plan: Arc<dyn ExecutionPlan> = Arc::new(insert_exec);
+
+        let task_ctx = ctx.task_ctx();
+        let result = datafusion_physical_plan::collect(insert_plan.clone(), task_ctx).await;
+        assert!(result.is_err(), "Expected execution to fail");
+
+        // No data should have been committed.
+        table.checkout_latest().await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 1);
+
+        // Verify that `did_reset` was cleared, allowing the next execution
+        // to properly reset state. Without this fix, `did_reset` would remain
+        // `true` and stale `any_partition_failed` state would leak.
+        let insert_ref = insert_plan.as_any().downcast_ref::<InsertExec>().unwrap();
+        assert!(
+            !insert_ref.did_reset.load(Ordering::SeqCst),
+            "did_reset should be false after all partitions completed, \
+             allowing next execution to reset state"
+        );
+
+        // Verify that the failure was recorded.
+        let state = insert_ref.exec_state.lock().unwrap();
+        assert!(
+            state.any_partition_failed,
+            "any_partition_failed should be true after a partition error"
+        );
+        assert_eq!(
+            state.completed_count, 2,
+            "all partitions should have reported completion"
+        );
+    }
+
+    /// Verifies that two successive successful insert executions via SQL both
+    /// commit correctly, proving state doesn't leak between runs.
+    #[tokio::test]
+    async fn test_insert_two_successive_executions() {
+        let tmp_dir = tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+
+        let db = connect(uri).execute().await.unwrap();
+
+        let batch = record_batch!(("id", Int32, [1])).unwrap();
+
+        let table = db
+            .create_table("test_successive", batch)
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(table.count_rows(None).await.unwrap(), 1);
+
+        let ctx = SessionContext::new();
+        let provider =
+            crate::table::datafusion::BaseTableAdapter::try_new(table.base_table().clone())
+                .await
+                .unwrap();
+        ctx.register_table("test_successive", Arc::new(provider))
+            .unwrap();
+
+        // First insert
+        ctx.sql("INSERT INTO test_successive VALUES (2), (3)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        table.checkout_latest().await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 3);
+
+        // Second insert on the same registered table
+        ctx.sql("INSERT INTO test_successive VALUES (4), (5)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        table.checkout_latest().await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 5);
     }
 }
