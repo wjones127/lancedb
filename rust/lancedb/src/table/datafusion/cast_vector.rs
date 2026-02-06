@@ -902,15 +902,33 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(
             schema,
-            vec![make_list_f32(&[Some(vec![1.0, 2.0]), Some(vec![3.0, 4.0])])],
+            vec![make_list_f32(&[
+                Some(vec![1.0, 2.0]),
+                None,
+                Some(vec![3.0, 4.0]),
+            ])],
         )
         .unwrap();
 
         let expr = CastToFixedSizeListExpr::new(source_col(), 2, DataType::Float16);
         let result = eval_expr(&expr, &batch);
         let fsl = result.as_fixed_size_list();
-        assert_eq!(fsl.len(), 2);
+        assert_eq!(fsl.len(), 3);
         assert_eq!(fsl.value_type(), DataType::Float16);
+
+        assert!(!fsl.is_null(0));
+        let row0 = fsl.value(0);
+        let vals0 = row0.as_primitive::<arrow_array::types::Float16Type>();
+        assert_eq!(vals0.value(0), half::f16::from_f32(1.0));
+        assert_eq!(vals0.value(1), half::f16::from_f32(2.0));
+
+        assert!(fsl.is_null(1));
+
+        assert!(!fsl.is_null(2));
+        let row2 = fsl.value(2);
+        let vals2 = row2.as_primitive::<arrow_array::types::Float16Type>();
+        assert_eq!(vals2.value(0), half::f16::from_f32(3.0));
+        assert_eq!(vals2.value(1), half::f16::from_f32(4.0));
     }
 
     #[test]
