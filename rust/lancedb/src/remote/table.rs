@@ -972,6 +972,7 @@ impl<S: HttpSend> BaseTable for RemoteTable<S> {
             plan,
             overwrite,
             progress,
+            add.ipc_compression,
         ));
         let insert_ref = insert.clone();
         let insert_plan: Arc<dyn ExecutionPlan> = insert;
@@ -1689,6 +1690,7 @@ impl<S: HttpSend> BaseTable for RemoteTable<S> {
             input,
             overwrite,
             None,
+            crate::table::add_data::IpcCompression::default(),
         )))
     }
 }
@@ -1761,6 +1763,7 @@ mod tests {
     use crate::index::vector::{IvfFlatIndexBuilder, IvfHnswSqIndexBuilder};
     use crate::remote::db::DEFAULT_SERVER_VERSION;
     use crate::remote::JSON_CONTENT_TYPE;
+    use crate::table::IpcCompression;
     use crate::{
         index::{vector::IvfPqIndexBuilder, Index, IndexStatistics, IndexType},
         query::{ExecutableQuery, QueryBase},
@@ -3743,5 +3746,40 @@ mod tests {
             Err(other) => panic!("Expected InvalidInput error, got: {:?}", other),
             Ok(_) => panic!("Expected error for non-finite float value"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_add_with_ipc_compression_zstd() {
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let describe_body = describe_response(&data.schema());
+
+        let table =
+            Table::new_with_handler("my_table", move |request| match request.url().path() {
+                "/v1/table/my_table/describe/" => http::Response::builder()
+                    .status(200)
+                    .body(describe_body.clone())
+                    .unwrap(),
+                "/v1/table/my_table/insert/" => {
+                    assert_eq!(request.method(), "POST");
+                    http::Response::builder()
+                        .status(200)
+                        .body(r#"{"version": 2}"#.to_string())
+                        .unwrap()
+                }
+                path => panic!("Unexpected request path: {}", path),
+            });
+
+        let result = table
+            .add(data)
+            .ipc_compression(IpcCompression::Zstd)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.version, 2);
     }
 }

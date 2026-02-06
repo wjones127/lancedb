@@ -75,6 +75,19 @@ impl std::fmt::Debug for WriteProgressState {
     }
 }
 
+/// IPC stream compression used when sending data to a remote LanceDB server.
+/// Has no effect on local tables.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum IpcCompression {
+    /// LZ4 frame compression (default).
+    #[default]
+    Lz4Frame,
+    /// Zstandard compression (better ratio, slightly slower).
+    Zstd,
+    /// No compression.
+    None,
+}
+
 #[derive(Debug, Clone, Default)]
 pub enum AddDataMode {
     /// Rows will be appended to the table (the default)
@@ -101,6 +114,7 @@ pub struct AddDataBuilder {
     pub(crate) write_options: WriteOptions,
     pub(crate) embedding_registry: Option<Arc<dyn EmbeddingRegistry>>,
     pub(crate) progress_callback: Option<Arc<dyn Fn(WriteProgress) + Send + Sync>>,
+    pub(crate) ipc_compression: IpcCompression,
 }
 
 impl std::fmt::Debug for AddDataBuilder {
@@ -126,6 +140,7 @@ impl AddDataBuilder {
             write_options: WriteOptions::default(),
             embedding_registry,
             progress_callback: None,
+            ipc_compression: IpcCompression::default(),
         }
     }
 
@@ -142,6 +157,13 @@ impl AddDataBuilder {
     /// Set a callback to receive progress updates during the write operation.
     pub fn progress(mut self, callback: impl Fn(WriteProgress) + Send + Sync + 'static) -> Self {
         self.progress_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// Set the IPC compression used when sending data to a remote server.
+    /// Has no effect on local tables. Defaults to LZ4 frame compression.
+    pub fn ipc_compression(mut self, compression: IpcCompression) -> Self {
+        self.ipc_compression = compression;
         self
     }
 

@@ -81,7 +81,9 @@ pub mod datafusion;
 pub(crate) mod dataset;
 pub mod merge;
 
-pub use add_data::{AddDataBuilder, AddDataMode, AddResult, WriteProgress, WriteProgressState};
+pub use add_data::{
+    AddDataBuilder, AddDataMode, AddResult, IpcCompression, WriteProgress, WriteProgressState,
+};
 
 use crate::index::waiter::wait_for_index;
 pub use chrono::Duration;
