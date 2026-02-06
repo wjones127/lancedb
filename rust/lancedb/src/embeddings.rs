@@ -86,6 +86,13 @@ pub trait EmbeddingRegistry: Send + Sync + std::fmt::Debug {
     fn register(&self, name: &str, function: Arc<dyn EmbeddingFunction>) -> Result<()>;
     /// Get an embedding function by name
     fn get(&self, name: &str) -> Option<Arc<dyn EmbeddingFunction>>;
+    /// Parse embedding definitions from schema metadata and resolve them against this registry.
+    fn parse_metadata_embeddings(
+        &self,
+        _schema: &SchemaRef,
+    ) -> Vec<(EmbeddingDefinition, Arc<dyn EmbeddingFunction>)> {
+        Vec::new()
+    }
 }
 
 /// A [`EmbeddingRegistry`] that uses in-memory [`HashMap`]s

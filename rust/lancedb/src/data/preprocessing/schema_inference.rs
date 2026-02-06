@@ -491,7 +491,7 @@ fn convert_list_to_fsl(
 }
 
 /// Extract per-row offsets (as i64) and the flat values buffer from a list array.
-fn get_list_offsets_and_values(arr: &dyn Array) -> Result<(Vec<i64>, ArrayRef)> {
+pub fn get_list_offsets_and_values(arr: &dyn Array) -> Result<(Vec<i64>, ArrayRef)> {
     match arr.data_type() {
         DataType::List(_) => {
             let list = arr.as_list::<i32>();
@@ -510,7 +510,7 @@ fn get_list_offsets_and_values(arr: &dyn Array) -> Result<(Vec<i64>, ArrayRef)> 
 }
 
 /// Build a FixedSizeList from pre-cast flat values using list offsets.
-fn build_fsl_from_offsets<B: ArrowValueBuilder>(
+pub fn build_fsl_from_offsets<B: ArrowValueBuilder>(
     arr: &dyn Array,
     offsets: &[i64],
     cast_values: &B::ArrayType,
@@ -558,7 +558,7 @@ fn build_fsl_from_offsets<B: ArrowValueBuilder>(
 }
 
 /// Trait abstracting over Float32Builder and UInt8Builder for generic FSL construction.
-trait ArrowValueBuilder: ArrayBuilder {
+pub trait ArrowValueBuilder: ArrayBuilder {
     type ArrayType: Array;
 
     fn builder_with_capacity(capacity: usize) -> Self;
@@ -580,6 +580,27 @@ impl ArrowValueBuilder for Float32Builder {
         let v = value as f32;
         for _ in 0..count {
             builder.append_value(v);
+        }
+    }
+    fn copy_range(builder: &mut Self, source: &Self::ArrayType, start: usize, len: usize) {
+        for j in 0..len {
+            builder.append_value(source.value(start + j));
+        }
+    }
+}
+
+impl ArrowValueBuilder for arrow_array::builder::Float64Builder {
+    type ArrayType = arrow_array::Float64Array;
+
+    fn builder_with_capacity(capacity: usize) -> Self {
+        Self::with_capacity(capacity)
+    }
+    fn append_nulls_n(builder: &mut Self, count: usize) {
+        builder.append_nulls(count);
+    }
+    fn append_fill(builder: &mut Self, count: usize, value: f64) {
+        for _ in 0..count {
+            builder.append_value(value);
         }
     }
     fn copy_range(builder: &mut Self, source: &Self::ArrayType, start: usize, len: usize) {

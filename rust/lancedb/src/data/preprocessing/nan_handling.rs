@@ -48,7 +48,7 @@ fn is_float_element(inner: &Field) -> bool {
 }
 
 /// Find all top-level float vector columns (FixedSizeList, List, or LargeList).
-fn find_float_vector_columns(schema: &SchemaRef) -> Vec<usize> {
+pub fn find_float_vector_columns(schema: &SchemaRef) -> Vec<usize> {
     schema
         .fields()
         .iter()
@@ -132,7 +132,7 @@ fn fill_column_rows(col: &dyn Array, fill: f64) -> Result<ArrayRef> {
 }
 
 /// Process a single batch: detect and handle NaN values in float vector columns.
-fn handle_nan_batch(
+pub fn handle_nan_batch(
     batch: RecordBatch,
     vec_cols: &[usize],
     strategy: &NanStrategy,
@@ -220,7 +220,7 @@ fn any_nan_in_fsl(arr: &FixedSizeListArray) -> bool {
 /// Compute a per-row boolean mask indicating which rows contain NaN values.
 ///
 /// Needed by Drop and Null strategies to know exactly which rows are affected.
-fn nan_row_mask(arr: &FixedSizeListArray) -> BooleanArray {
+pub fn nan_row_mask(arr: &FixedSizeListArray) -> BooleanArray {
     let values = arr.values();
     let n = arr.len();
     let dim = arr.value_length() as usize;
@@ -454,7 +454,7 @@ fn fill_list_rows<O: OffsetSizeTrait>(arr: &dyn Array, fill: f64) -> Result<Arra
 }
 
 /// Replace NaN-containing rows with null by updating the validity bitmap.
-fn nullify_fsl_rows(fsl: &FixedSizeListArray, is_bad: &BooleanArray) -> Result<ArrayRef> {
+pub fn nullify_fsl_rows(fsl: &FixedSizeListArray, is_bad: &BooleanArray) -> Result<ArrayRef> {
     let n = fsl.len();
     let mut builder = NullBufferBuilder::new(n);
     for row in 0..n {

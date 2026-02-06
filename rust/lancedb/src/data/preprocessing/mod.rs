@@ -17,7 +17,11 @@
 mod nan_handling;
 mod schema_inference;
 
+pub(crate) use nan_handling::{
+    find_float_vector_columns, handle_nan_batch, nan_row_mask, nullify_fsl_rows,
+};
 pub use nan_handling::{handle_nan_vectors, NanStrategy};
+pub(crate) use schema_inference::{build_fsl_from_offsets, get_list_offsets_and_values};
 pub use schema_inference::{
     find_vector_candidates, infer_vector_schema, BadVectorStrategy, FieldPath,
 };
