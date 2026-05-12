@@ -250,10 +250,11 @@ fn validate_fields(input: &Fields, table: &Fields) -> Result<()> {
 mod tests {
     use std::sync::Arc;
 
+    use arrow::array::AsArray;
     use arrow::datatypes::Float64Type;
     use arrow_array::{
-        FixedSizeListArray, Float32Array, Int32Array, LargeStringArray, ListArray, RecordBatch,
-        RecordBatchIterator, record_batch,
+        Array, FixedSizeListArray, Float32Array, Int32Array, LargeStringArray, ListArray,
+        RecordBatch, RecordBatchIterator, record_batch,
     };
     use arrow_schema::{ArrowError, DataType, Field, Schema};
     use futures::TryStreamExt;
@@ -792,7 +793,10 @@ mod tests {
         let data_field = stored_field.field_with_name("data").unwrap();
         assert_eq!(data_field.data_type(), &DataType::LargeBinary);
         assert_eq!(
-            data_field.metadata().get("ARROW:extension:name").map(|s| s.as_str()),
+            data_field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(|s| s.as_str()),
             Some(JSON_EXT_NAME),
         );
 
@@ -803,16 +807,14 @@ mod tests {
             "ARROW:extension:name".to_string(),
             ARROW_JSON_EXT_NAME.to_string(),
         );
-        let arrow_json_field = Field::new("data", DataType::Utf8, true)
-            .with_metadata(arrow_json_metadata);
+        let arrow_json_field =
+            Field::new("data", DataType::Utf8, true).with_metadata(arrow_json_metadata);
         let arrow_json_schema = Arc::new(Schema::new(vec![arrow_json_field]));
 
         let json_values: Vec<Option<&str>> = vec![None, Some(r#"{"a": 1}"#), Some(r#"{"b": 2}"#)];
-        let string_array: Arc<dyn arrow_array::Array> = Arc::new(
-            arrow_array::StringArray::from(json_values),
-        );
-        let batch =
-            RecordBatch::try_new(arrow_json_schema, vec![string_array]).unwrap();
+        let string_array: Arc<dyn arrow_array::Array> =
+            Arc::new(arrow_array::StringArray::from(json_values));
+        let batch = RecordBatch::try_new(arrow_json_schema, vec![string_array]).unwrap();
 
         // This must not fail with a schema-mismatch error.
         table.add(batch).execute().await.unwrap();
@@ -845,13 +847,13 @@ mod tests {
 
         // Row 1: {"a": 1}
         assert!(!json_bytes.is_null(1));
-        let json1 = serde_json::from_slice::<serde_json::Value>(json_bytes.value(1).as_ref())
+        let json1 = serde_json::from_slice::<serde_json::Value>(json_bytes.value(1))
             .expect("JSON should be valid");
         assert_eq!(json1, serde_json::json!({"a": 1}));
 
         // Row 2: {"b": 2}
         assert!(!json_bytes.is_null(2));
-        let json2 = serde_json::from_slice::<serde_json::Value>(json_bytes.value(2).as_ref())
+        let json2 = serde_json::from_slice::<serde_json::Value>(json_bytes.value(2))
             .expect("JSON should be valid");
         assert_eq!(json2, serde_json::json!({"b": 2}));
     }
@@ -880,7 +882,10 @@ mod tests {
         let data_field = stored_field.field_with_name("data").unwrap();
         assert_eq!(data_field.data_type(), &DataType::LargeBinary);
         assert_eq!(
-            data_field.metadata().get("ARROW:extension:name").map(|s| s.as_str()),
+            data_field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(|s| s.as_str()),
             Some(JSON_EXT_NAME),
         );
 
@@ -890,16 +895,14 @@ mod tests {
             "ARROW:extension:name".to_string(),
             ARROW_JSON_EXT_NAME.to_string(),
         );
-        let arrow_json_field = Field::new("data", DataType::LargeUtf8, true)
-            .with_metadata(arrow_json_metadata);
+        let arrow_json_field =
+            Field::new("data", DataType::LargeUtf8, true).with_metadata(arrow_json_metadata);
         let arrow_json_schema = Arc::new(Schema::new(vec![arrow_json_field]));
 
         let json_values: Vec<Option<&str>> = vec![None, Some(r#"{"x": 10}"#), Some(r#"{"y": 20}"#)];
-        let string_array: Arc<dyn arrow_array::Array> = Arc::new(
-            arrow_array::LargeStringArray::from(json_values),
-        );
-        let batch =
-            RecordBatch::try_new(arrow_json_schema, vec![string_array]).unwrap();
+        let string_array: Arc<dyn arrow_array::Array> =
+            Arc::new(arrow_array::LargeStringArray::from(json_values));
+        let batch = RecordBatch::try_new(arrow_json_schema, vec![string_array]).unwrap();
 
         // This must not fail with a schema-mismatch error.
         table.add(batch).execute().await.unwrap();
@@ -930,13 +933,13 @@ mod tests {
 
         // Row 1: {"x": 10}
         assert!(!json_bytes.is_null(1));
-        let json1 = serde_json::from_slice::<serde_json::Value>(json_bytes.value(1).as_ref())
+        let json1 = serde_json::from_slice::<serde_json::Value>(json_bytes.value(1))
             .expect("JSON should be valid");
         assert_eq!(json1, serde_json::json!({"x": 10}));
 
         // Row 2: {"y": 20}
         assert!(!json_bytes.is_null(2));
-        let json2 = serde_json::from_slice::<serde_json::Value>(json_bytes.value(2).as_ref())
+        let json2 = serde_json::from_slice::<serde_json::Value>(json_bytes.value(2))
             .expect("JSON should be valid");
         assert_eq!(json2, serde_json::json!({"y": 20}));
     }
